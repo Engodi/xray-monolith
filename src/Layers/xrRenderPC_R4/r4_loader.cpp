@@ -14,6 +14,7 @@
 #include "../xrRenderDX10/3DFluid/dx103DFluidVolume.h"
 
 #include "../xrRender/FHierrarhyVisual.h"
+#include "../../xrCore/headless.h"
 
 #pragma warning(push)
 #pragma warning(disable:4995)
@@ -24,6 +25,17 @@ void CRender::level_Load(IReader* fs)
 {
 	R_ASSERT(0!=g_pGameLevel);
 	R_ASSERT(!b_loaded);
+
+	// Headless (F0-04): level geometry, the visual library and shaders live in
+	// GPU buffers that do not exist without a device. The simulation keeps its
+	// own CPU-side data (level.cform, AI graph, spawns) and runs without
+	// renderables, so the render part of the level load is skipped here.
+	if (Headless::Active())
+	{
+		Msg("* [headless] level render load skipped (no GPU)");
+		b_loaded = TRUE;
+		return;
+	}
 
 	// Begin
 	pApp->LoadBegin();
@@ -123,6 +135,13 @@ void CRender::level_Unload()
 {
 	if (0 == g_pGameLevel) return;
 	if (!b_loaded) return;
+
+	// Headless: nothing was loaded into the renderer (F0-04).
+	if (Headless::Active())
+	{
+		b_loaded = FALSE;
+		return;
+	}
 
 	u32 I;
 

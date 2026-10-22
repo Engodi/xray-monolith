@@ -6,6 +6,7 @@
 #include "render.h"
 #include "dedicated_server_only.h"
 #include "../xrcdb/xrxrc.h"
+#include "../xrCore/headless.h"
 
 //#include "securom_api.h"
 
@@ -120,7 +121,8 @@ void CRenderDevice::_Create(LPCSTR shName)
 	_SetupStates();
 
 	m_pRender->OnDeviceCreate(shName);
-	m_imgui.OnDeviceCreate();
+	if (!Headless::Active())
+		m_imgui.OnDeviceCreate();
 	dwFrame = 0;
 }
 
@@ -171,30 +173,35 @@ PROTECT_API void CRenderDevice::Create()
 
 	if (b_is_Ready) return; // prevent double call
 
-	u32 w, h;
-	GetMonitorResolution(w, h);
-	int monX, monY;
-	GetMonitorPosition(monX, monY);
-	if (psCurrentVidMode[0] == 0 || psCurrentVidMode[1] == 0)
+	// A headless device owns no window geometry: no monitor probing and no
+	// window restyling, the window itself stays hidden for the whole run.
+	if (!Headless::Active())
 	{
-		psCurrentVidMode[0] = w;
-		psCurrentVidMode[1] = h;
-	}
+		u32 w, h;
+		GetMonitorResolution(w, h);
+		int monX, monY;
+		GetMonitorPosition(monX, monY);
+		if (psCurrentVidMode[0] == 0 || psCurrentVidMode[1] == 0)
+		{
+			psCurrentVidMode[0] = w;
+			psCurrentVidMode[1] = h;
+		}
 
-	DWORD style;
-	if (g_screenmode == 0)
-	{
-		style = WS_OVERLAPPEDWINDOW;
-		w = psCurrentVidMode[0];
-		h = psCurrentVidMode[1];
-	}
-	else
-	{
-		style = WS_POPUP;
-	}
+		DWORD style;
+		if (g_screenmode == 0)
+		{
+			style = WS_OVERLAPPEDWINDOW;
+			w = psCurrentVidMode[0];
+			h = psCurrentVidMode[1];
+		}
+		else
+		{
+			style = WS_POPUP;
+		}
 
-	SetWindowLongPtr(m_hWnd, GWL_STYLE, style);
-	SetWindowPos(m_hWnd, HWND_TOP, monX, monY, w, h, SWP_FRAMECHANGED);
+		SetWindowLongPtr(m_hWnd, GWL_STYLE, style);
+		SetWindowPos(m_hWnd, HWND_TOP, monX, monY, w, h, SWP_FRAMECHANGED);
+	}
 
 	Statistic = xr_new<CStats>();
 #ifdef DEBUG
@@ -203,6 +210,12 @@ PROTECT_API void CRenderDevice::Create()
     cdb_clFRUSTUM = &Statistic->clFRUSTUM; // total: frustum query
     cdb_bDebug = &bDebug;
 #endif
+
+	if (Headless::Active())
+	{
+		CreateHeadless();
+		return;
+	}
 
 	if (!m_pRender)
 		m_pRender = RenderFactory->CreateRenderDeviceRender();
@@ -247,4 +260,33 @@ PROTECT_API void CRenderDevice::Create()
 	PreCache(0, false, false);
 
 	//SECUROM_MARKER_SECURITY_OFF(4)
+}
+
+// Headless device (F0-04, NFR-ARCH-7): the same render device object drives the
+// engine, but it is created without a swap chain, a D3D device or a visible
+// window. Only CPU-side manager state is allocated, so the game / network loop
+// of a headless process keeps running with no GPU and no window focus.
+void CRenderDevice::CreateHeadless()
+{
+	Headless::ConfigureBackbuffer(dwWidth, dwHeight);
+	fWidth_2 = float(dwWidth) / 2.0f;
+	fHeight_2 = float(dwHeight) / 2.0f;
+	fFOV = 90.0f;
+	fASPECT = 1.0f;
+
+	if (!m_pRender)
+		m_pRender = RenderFactory->CreateRenderDeviceRender();
+
+	Log("* [headless] Starting device without D3D...");
+	// The render device recognises the headless profile and skips HW setup.
+	m_pRender->Create(m_hWnd, dwWidth, dwHeight, fWidth_2, fHeight_2, false);
+
+	string_path fname;
+	FS.update_path(fname, "$game_data$", "shaders.xr");
+	_Create(fname);
+
+	// no loading screen and no precache frames without a device
+	PreCache(0, false, false);
+
+	Msg("* [headless] device ready: %ux%u, no swap chain", dwWidth, dwHeight);
 }

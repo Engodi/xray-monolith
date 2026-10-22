@@ -2,6 +2,7 @@
 #pragma hdrstop
 
 #include "SoundRender_CoreA.h"
+#include "../xrCore/headless.h"
 
 XRSOUND_API xr_token* snd_devices_token = NULL;
 XRSOUND_API xr_string snd_device_name;
@@ -14,7 +15,9 @@ void CSound_manager_interface::_create(int stage)
 		SoundRender = SoundRenderA;
 		Sound = SoundRender;
 
-		if (strstr(Core.Params, "-nosound"))
+		// Headless profiles never open an audio device: the sound manager stays
+		// a valid no-op object so gameplay sound calls are safe (F0-04).
+		if (strstr(Core.Params, "-nosound") || Headless::Active())
 		{
 			SoundRender->bPresent = FALSE;
 			return;

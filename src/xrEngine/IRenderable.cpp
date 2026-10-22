@@ -18,7 +18,9 @@ extern ENGINE_API BOOL g_bRendering;
 IRenderable::~IRenderable()
 {
 	VERIFY(!g_bRendering);
-	Render->model_Delete(renderable.visual);
+	// Headless processes may own renderables without a GPU model (F0-04).
+	if (renderable.visual)
+		Render->model_Delete(renderable.visual);
 	if (renderable.pROS) Render->ros_destroy(renderable.pROS);
 	renderable.visual = NULL;
 	renderable.pROS = NULL;

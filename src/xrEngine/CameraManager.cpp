@@ -5,6 +5,7 @@
 #include "stdafx.h"
 #include "igame_level.h"
 #include "igame_persistent.h"
+#include "../xrCore/headless.h"
 
 #include "Environment.h"
 #include "CameraBase.h"
@@ -505,7 +506,12 @@ void CCameraManager::ApplyDevice(float _viewport_near)
 	Device.mInvProjectHud.invert(Device.mProjectHud);
 	//--#SM+# End--
 
-	if (g_pGamePersistent && g_pGamePersistent->m_pMainMenu->IsActive())
+	// Headless: there is no postprocess target to program (F0-04). The camera
+	// math above is kept: the simulation reads the camera placement.
+	if (!Headless::RenderEnabled())
+		return;
+
+	if (g_pGamePersistent && g_pGamePersistent->m_pMainMenu && g_pGamePersistent->m_pMainMenu->IsActive())
 		ResetPP();
 	else
 	{

@@ -115,6 +115,8 @@ namespace text_editor
 		const bool alt = control->get_key_state(ks_Alt);
 		const bool altgr = control->get_key_state(ks_RAlt);
 		if (m_translate) {
+			if (!pInput)
+				return;
 			if (pInput->dik_to_text((int)m_dik, shift, caps, ctrl, alt, altgr, out, sizeof(out)))
 			{
 				control->insert_text(out);

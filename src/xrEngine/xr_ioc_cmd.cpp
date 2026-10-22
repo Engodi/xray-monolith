@@ -923,11 +923,14 @@ public:
 			value = false;
 		else InvalidSyntax();
 
-		pInput->exclusive_mode(value);
+		if (pInput)
+			pInput->exclusive_mode(value);
 	}
 
 	virtual void Save(IWriter* F)
 	{
+		if (!pInput)
+			return;
 		F->w_printf("input_exclusive_mode %s\r\n", pInput->get_exclusive_mode() ? "on" : "off");
 	}
 };

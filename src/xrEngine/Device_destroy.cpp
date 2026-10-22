@@ -5,9 +5,19 @@
 #include "IGame_Persistent.h"
 #include "xr_IOConsole.h"
 #include "MonitorList.h"
+#include "../xrCore/headless.h"
 
 void CRenderDevice::_Destroy(BOOL bKeepTextures)
 {
+	// Headless: there is no device state, no shaders and no rendered targets to
+	// release - only the CPU-side bookkeeping has to go (F0-04).
+	if (Headless::Active())
+	{
+		b_is_Ready = FALSE;
+		Memory.mem_compact();
+		return;
+	}
+
 	DU->OnDeviceDestroy();
 
 	// before destroy
@@ -28,14 +38,18 @@ void CRenderDevice::Destroy(void)
 
 	Log("Destroying Direct3D...");
 
-	ShowCursor(TRUE);
-	ClipCursor(NULL);
-	m_pRender->ValidateHW();
+	if (!Headless::Active())
+	{
+		ShowCursor(TRUE);
+		ClipCursor(NULL);
+		m_pRender->ValidateHW();
+	}
 
 	_Destroy(FALSE);
 
 	// real destroy
-	m_pRender->DestroyHW();
+	if (!Headless::Active())
+		m_pRender->DestroyHW();
 
 	//xr_delete (Resources);
 	//HW.DestroyDevice ();
@@ -67,6 +81,10 @@ extern ENGINE_API u32 psCurrentVidMode[];
 
 void CRenderDevice::Reset(bool precache)
 {
+	// Headless: no swap chain, no device reset, no gamma state (F0-04).
+	if (Headless::Active())
+		return;
+
 	if (use_reshade)
 		unregister_reshade();
 
@@ -128,6 +146,8 @@ void CRenderDevice::Reset(bool precache)
 bool CRenderDevice::ChangeOutputMonitor(HMONITOR hTargetMon)
 {
 	static bool s_swap_in_progress = false;
+	if (Headless::Active())
+		return false; // no output monitor without a device
 	if (!b_is_Ready)
 		return false;
 	if (s_swap_in_progress)

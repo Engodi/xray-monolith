@@ -4,6 +4,7 @@
 #include "../xrEngine/xr_ioconsole.h"
 #include "../xrEngine/gamemtllib.h"
 #include "../Include/xrRender/Kinematics.h"
+#include "../xrCore/headless.h"
 #include "profiler.h"
 #include "MainMenu.h"
 #include "script_wallmarks_manager.h"
@@ -159,15 +160,20 @@ void CGamePersistent::OnAppStart()
 	GMLib.Load();
 	init_game_globals();
 	__super::OnAppStart();
-	m_pUI_core = xr_new<ui_core>();
-	m_pMainMenu = xr_new<CMainMenu>();
+	// Headless (F0-04): no UI core and no main menu - they are pure presentation
+	// and both allocate device resources.
+	if (Headless::UiEnabled())
+	{
+		m_pUI_core = xr_new<ui_core>();
+		m_pMainMenu = xr_new<CMainMenu>();
+	}
 	m_pWallmarksManager = xr_new<ScriptWallmarksManager>();
 }
 
 
 void CGamePersistent::OnAppEnd()
 {
-	if (m_pMainMenu->IsActive())
+	if (m_pMainMenu && m_pMainMenu->IsActive())
 		m_pMainMenu->Activate(false);
 
 	xr_delete(m_pMainMenu);
@@ -728,7 +734,7 @@ void CGamePersistent::OnFrame()
 	if (!g_dedicated_server && Device.dwPrecacheFrame == 0 && !m_intro && m_intro_event.empty())
 		load_screen_renderer.stop();
 
-	if (!m_pMainMenu->IsActive())
+	if (m_pMainMenu && !m_pMainMenu->IsActive())
 		m_pMainMenu->DestroyInternal(false);
 
 	if (!g_pGameLevel) return;

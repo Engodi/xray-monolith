@@ -4,6 +4,9 @@
     <Filter Include="General">
       <UniqueIdentifier>{789b2b01-e97a-4aef-b3c2-0281708942c5}</UniqueIdentifier>
     </Filter>
+    <Filter Include="General\Headless">
+      <UniqueIdentifier>{3f9c1b7e-58d2-4c6a-8b70-91e4d2a6c530}</UniqueIdentifier>
+    </Filter>
     <Filter Include="General\Resources">
       <UniqueIdentifier>{e11e63ee-7e2c-4cae-8562-81d199ac71df}</UniqueIdentifier>
     </Filter>
@@ -179,6 +182,9 @@
     </ClInclude>
     <ClInclude Include="trivial_encryptor.h">
       <Filter>General</Filter>
+    </ClInclude>
+    <ClInclude Include="xr_headless.h">
+      <Filter>General\Headless</Filter>
     </ClInclude>
     <ClInclude Include="x_ray.h">
       <Filter>General</Filter>
@@ -505,6 +511,9 @@
     </ClCompile>
     <ClCompile Include="stdafx.cpp">
       <Filter>General</Filter>
+    </ClCompile>
+    <ClCompile Include="xr_headless.cpp">
+      <Filter>General\Headless</Filter>
     </ClCompile>
     <ClCompile Include="x_ray.cpp">
       <Filter>General</Filter>

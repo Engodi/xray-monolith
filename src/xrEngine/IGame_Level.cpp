@@ -197,7 +197,9 @@ void IGame_Level::OnFrame()
 	// Update all objects
 	VERIFY(bReady);
 	Objects.Update(false);
-	g_hud->OnFrame();
+	// Headless: the HUD may be absent (no UI at all, F0-04).
+	if (g_hud)
+		g_hud->OnFrame();
 
 	// Ambience
 	if (Sounds_Random.size() && (Device.dwTimeGlobal > Sounds_Random_dwNextTime))

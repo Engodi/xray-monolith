@@ -16,6 +16,7 @@
 
 #include "../../xrCore/profiler.h"
 #include "../../xrCore/ShaderSourceCRC.h"
+#include "../../xrCore/headless.h"
 
 #include "D3DX10Core.h"
 
@@ -199,6 +200,20 @@ extern ENGINE_API BOOL r2_advanced_pp; //	advanced post process and effects
 // Just two static storage
 void CRender::create()
 {
+	// Headless (F0-04): no device, no shaders, no GPU resources. Only the
+	// CPU-side subsystems the simulation refers to are allocated, so a headless
+	// process can spawn/update objects without a render device.
+	if (Headless::Active())
+	{
+		Models = xr_new<CModelPool>();
+		m_skinning = -1;
+		m_MSAASample = -1;
+		c_lmaterial = "L_material";
+		c_sbase = "s_base";
+		Msg("* [headless] render core: CPU-only init (no device, no shaders)");
+		return;
+	}
+
 	Device.seqFrame.Add(this,REG_PRIORITY_HIGH + 0x12345678);
 
 	m_skinning = -1;
@@ -699,12 +714,18 @@ void CRender::ImportParticles()
 // Implementation
 IRender_ObjectSpecific* CRender::ros_create(IRenderable* parent) { return xr_new<CROS_impl>(); }
 void CRender::ros_destroy(IRender_ObjectSpecific* & p) { xr_delete(p); }
-IRenderVisual* CRender::model_Create(LPCSTR name, IReader* data) { return Models->Create(name, data); }
-IRenderVisual* CRender::model_CreateChild(LPCSTR name, IReader* data) { return Models->CreateChild(name, data); }
-IRenderVisual* CRender::model_Duplicate(IRenderVisual* V) { return Models->Instance_Duplicate((dxRender_Visual*)V); }
+IRenderVisual* CRender::model_Create(LPCSTR name, IReader* data) { return Models ? Models->Create(name, data) : nullptr; }
+IRenderVisual* CRender::model_CreateChild(LPCSTR name, IReader* data) { return Models ? Models->CreateChild(name, data) : nullptr; }
+IRenderVisual* CRender::model_Duplicate(IRenderVisual* V) { return Models ? Models->Instance_Duplicate((dxRender_Visual*)V) : nullptr; }
 
 void CRender::model_Delete(IRenderVisual* & V, BOOL bDiscard)
 {
+	// Headless: there is no model pool, so nothing to release (F0-04).
+	if (!Models)
+	{
+		V = 0;
+		return;
+	}
 	dxRender_Visual* pVisual = (dxRender_Visual*)V;
 	Models->Delete(pVisual, bDiscard);
 	V = 0;
@@ -747,10 +768,10 @@ IRenderVisual* CRender::model_CreateParticles(LPCSTR name)
 	}
 }
 
-void CRender::models_Prefetch() { Models->Prefetch(); }
-void CRender::models_PrefetchOne(LPCSTR name, bool assert) { Models->Prefetch_One(name, assert); }
-void CRender::models_Clear(BOOL b_complete) { Models->ClearPool(b_complete); }
-bool CRender::models_Exists(LPCSTR name) { return Models->Exists(name); }
+void CRender::models_Prefetch() { if (Models) Models->Prefetch(); }
+void CRender::models_PrefetchOne(LPCSTR name, bool assert) { if (Models) Models->Prefetch_One(name, assert); }
+void CRender::models_Clear(BOOL b_complete) { if (Models) Models->ClearPool(b_complete); }
+bool CRender::models_Exists(LPCSTR name) { return Models ? Models->Exists(name) : false; }
 
 ref_shader CRender::getShader(int id)
 {

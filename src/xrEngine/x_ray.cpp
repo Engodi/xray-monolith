@@ -12,6 +12,8 @@
 #include "dedicated_server_only.h"
 #include "no_single.h"
 #include "../xrNetServer/NET_AuthCheck.h"
+#include "../xrCore/headless.h"
+#include "xr_headless.h"
 
 #include "xr_input.h"
 #include "xr_ioconsole.h"
@@ -578,7 +580,8 @@ void clearDiscordPresence()
 void Startup()
 {
 #ifndef DEDICATED_SERVER
-	fill_vid_monitor_list();
+	if (!Headless::Active())
+		fill_vid_monitor_list();
 #endif
 
 	InitSound1();
@@ -586,6 +589,8 @@ void Startup()
 	InitSound2();
 
 #ifndef DEDICATED_SERVER
+	// Headless: no monitor list, no monitor override - there is no output window.
+	if (!Headless::Active())
 	{
 		LPCSTR p = strstr(Core.Params, "-vid_monitor ");
 		if (p)
@@ -636,6 +641,9 @@ void Startup()
 	// Initialize APP
 	Device.Create();
 
+	// Headless: heartbeat + deferred debug launch flags (F0-04, PLAN §8.11)
+	Headless::InitializeRuntime();
+
 	LALib.OnCreate();
 	pApp = xr_new<CApplication>();
 	g_pGamePersistent = (IGame_Persistent*)NEW_INSTANCE(CLSID_GAME_PERSISTANT);
@@ -646,21 +654,28 @@ void Startup()
 	DestroyWindow(logoWindow);
 	logoWindow = NULL;
 
-	//Discord Rich Presence - Rezy
-	Init_Discord();
+	// Headless: no Discord Rich Presence and no ReShade - neither has a use
+	// without a window and both need a display to be verified (F0-04).
+	if (!Headless::Active())
+	{
+		//Discord Rich Presence - Rezy
+		Init_Discord();
 
-	//Reshade
-	use_reshade = init_reshade();
-	if (use_reshade)
-		Msg("[ReShade]: Loaded compatibility addon");
-	else
-		Msg("[ReShade]: ReShade not installed or version too old - didn't load compatibility addon");
+		//Reshade
+		use_reshade = init_reshade();
+		if (use_reshade)
+			Msg("[ReShade]: Loaded compatibility addon");
+		else
+			Msg("[ReShade]: ReShade not installed or version too old - didn't load compatibility addon");
+	}
 
 	// Main cycle
 	Msg("* [x-ray]: Starting Main Loop");
 	Memory.mem_usage();
 
 	Device.Run();
+
+	Headless::ShutdownRuntime();
 
 	// Discord
 	clearDiscordPresence();
@@ -696,7 +711,8 @@ void Startup()
 	destroySound();
 
 #ifndef DEDICATED_SERVER
-	free_vid_monitor_list();
+	if (!Headless::Active())
+		free_vid_monitor_list();
 #endif
 
 	destroyEngine();
@@ -960,10 +976,14 @@ int APIENTRY WinMain_impl(HINSTANCE hInstance,
                           char* lpCmdLine,
                           int nCmdShow)
 {
+	// Headless profiles (F0-04) are resolved before anything else touches the
+	// window system, the audio device or D3D.
+	Headless::Parse(lpCmdLine);
+
 #ifdef DEDICATED_SERVER
     Debug._initialize(true);
 #else // DEDICATED_SERVER
-	Debug._initialize(false);
+	Debug._initialize(Headless::Active());
 #endif // DEDICATED_SERVER
 
 	if (!IsDebuggerPresent())
@@ -1033,44 +1053,51 @@ int APIENTRY WinMain_impl(HINSTANCE hInstance,
     g_dedicated_server = true;
 #endif // DEDICATED_SERVER
 
-	// Title window
-    logoWindow = CreateDialog(GetModuleHandle(NULL), MAKEINTRESOURCE(IDD_STARTUP), 0, logDlgProc);
-   
-	HWND logoPicture = GetDlgItem(logoWindow, IDC_STATIC_LOGO);
-	RECT logoRect;
-	GetWindowRect(logoPicture, &logoRect);
-	int splashW = logoRect.right - logoRect.left;
-	int splashH = logoRect.bottom - logoRect.top;
+	// Title window (headless: no window at all, not even a splash screen)
+	if (!Headless::Active())
+	{
+		logoWindow = CreateDialog(GetModuleHandle(NULL), MAKEINTRESOURCE(IDD_STARTUP), 0, logDlgProc);
 
-	u32 screenW, screenH;
-	int monX, monY;
-	GetMonitorResolution(screenW, screenH);
-	GetMonitorPosition(monX, monY);
-	int x = monX + (screenW - splashW) / 2;
-	int y = monY + (screenH - splashH) / 2;
+		HWND logoPicture = GetDlgItem(logoWindow, IDC_STATIC_LOGO);
+		RECT logoRect;
+		GetWindowRect(logoPicture, &logoRect);
+		int splashW = logoRect.right - logoRect.left;
+		int splashH = logoRect.bottom - logoRect.top;
 
-    // verdatim: set the size of the splash window to be zero when the flag "-nosplashwindow" is given
-    if (strstr(xr_strdup(GetCommandLine()), "-nosplashwindow")) {
-        splashW = int(0);
-        splashH = int(0);
-    }
+		u32 screenW, screenH;
+		int monX, monY;
+		GetMonitorResolution(screenW, screenH);
+		GetMonitorPosition(monX, monY);
+		int x = monX + (screenW - splashW) / 2;
+		int y = monY + (screenH - splashH) / 2;
+
+		// verdatim: set the size of the splash window to be zero when the flag "-nosplashwindow" is given
+		if (strstr(xr_strdup(GetCommandLine()), "-nosplashwindow")) {
+			splashW = int(0);
+			splashH = int(0);
+		}
 
 
-	SetWindowPos(
-		logoWindow,
+		SetWindowPos(
+			logoWindow,
 #ifndef DEBUG
-        HWND_TOP,
+			HWND_TOP,
 #else
-        HWND_NOTOPMOST,
+			HWND_NOTOPMOST,
 #endif // NDEBUG
-		x,
-		y,
-		splashW,
-		splashH,
-		SWP_SHOWWINDOW
-	);
-	
-	UpdateWindow(logoWindow);
+			x,
+			y,
+			splashW,
+			splashH,
+			SWP_SHOWWINDOW
+		);
+
+		UpdateWindow(logoWindow);
+	}
+	else
+	{
+		logoWindow = NULL;
+	}
 
 	// AVI
 	g_bIntroFinished = TRUE;
@@ -1095,6 +1122,15 @@ int APIENTRY WinMain_impl(HINSTANCE hInstance,
 
 	InitSettings();
 	Msg(XRAY_MONOLITH_VERSION);
+
+	// Headless (F0-04): reuse the engine's existing "no GPU / no local output"
+	// gating (originally the DEDICATED_SERVER build switch) as a runtime mode,
+	// and log the resolved configuration for the harness logs.
+	if (Headless::Active())
+	{
+		g_dedicated_server = true;
+		Headless::LogConfig();
+	}
 
 	{
 		FS_FileSet fset;
@@ -1137,7 +1173,10 @@ int APIENTRY WinMain_impl(HINSTANCE hInstance,
 		FPU::m24r();
 		InitEngine();
 
-		InitInput();
+		// Headless has no input hardware: the bot input comes from the network /
+		// script layer, so DirectInput is never opened (F0-04).
+		if (!Headless::Active())
+			InitInput();
 
 		InitConsole();
 
@@ -1177,15 +1216,20 @@ int APIENTRY WinMain_impl(HINSTANCE hInstance,
 		};
 
 #ifndef DEDICATED_SERVER
-		if (strstr(Core.Params, "-r2a"))
-			Console->Execute("renderer renderer_r2a");
-		else if (strstr(Core.Params, "-r2"))
-			Console->Execute("renderer renderer_r2");
-		else
+		// Headless keeps the built-in headless render token: the renderer library
+		// is still linked in, but no device is ever created (F0-04).
+		if (!Headless::Active())
 		{
-			CCC_LoadCFG_custom* pTmp = xr_new<CCC_LoadCFG_custom>("renderer ");
-			pTmp->Execute(Console->ConfigFile);
-			xr_delete(pTmp);
+			if (strstr(Core.Params, "-r2a"))
+				Console->Execute("renderer renderer_r2a");
+			else if (strstr(Core.Params, "-r2"))
+				Console->Execute("renderer renderer_r2");
+			else
+			{
+				CCC_LoadCFG_custom* pTmp = xr_new<CCC_LoadCFG_custom>("renderer ");
+				pTmp->Execute(Console->ConfigFile);
+				xr_delete(pTmp);
+			}
 		}
 #else
         Console->Execute("renderer renderer_r1");
@@ -1520,9 +1564,12 @@ void CApplication::LoadBegin()
 		//-AVO
 
 #ifndef DEDICATED_SERVER
-		_InitializeFont(pFontSystem, "ui_font_letterica18_russian", 0);
+		if (!Headless::Active())
+		{
+			_InitializeFont(pFontSystem, "ui_font_letterica18_russian", 0);
 
-		m_pRender->LoadBegin();
+			m_pRender->LoadBegin();
+		}
 #endif
 		phase_timer.Start();
 		load_stage = 0;
@@ -1544,7 +1591,8 @@ void CApplication::LoadEnd()
 
 void CApplication::destroy_loading_shaders()
 {
-	m_pRender->destroy_loading_shaders();
+	if (!Headless::Active())
+		m_pRender->destroy_loading_shaders();
 
 	//AVO:
 	g_bootComplete = TRUE;
@@ -1562,6 +1610,12 @@ PROTECT_API void CApplication::LoadDraw()
 	PROF_EVENT();
 
 	if (g_appLoaded) return;
+
+	// Headless: the loading screen is pure presentation - there is no device to
+	// draw it with, and the level keeps loading without it (F0-04).
+	if (Headless::Active())
+		return;
+
 	Device.dwFrame += 1;
 
 

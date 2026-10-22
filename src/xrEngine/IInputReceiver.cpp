@@ -4,20 +4,33 @@
 #include "xr_input.h"
 #include "iinputreceiver.h"
 
+// Headless profiles (F0-04) never open an input device; the helpers below are
+// still reached from the console/UI code, so they degrade to "no input" instead
+// of dereferencing a null device.
+
 void IInputReceiver::IR_Capture()
 {
+	if (!pInput)
+		return;
 	VERIFY(pInput);
 	pInput->iCapture(this);
 }
 
 void IInputReceiver::IR_Release()
 {
+	if (!pInput)
+		return;
 	VERIFY(pInput);
 	pInput->iRelease(this);
 }
 
 void IInputReceiver::IR_GetLastMouseDelta(Ivector2& p)
 {
+	if (!pInput)
+	{
+		p.set(0, 0);
+		return;
+	}
 	VERIFY(pInput);
 	pInput->iGetLastMouseDelta(p);
 }
@@ -42,12 +55,16 @@ void IInputReceiver::IR_OnActivate(void)
 
 BOOL IInputReceiver::IR_GetKeyState(int dik)
 {
+	if (!pInput)
+		return FALSE;
 	VERIFY(pInput);
 	return pInput->iGetAsyncKeyState(dik);
 }
 
 BOOL IInputReceiver::IR_GetBtnState(int btn)
 {
+	if (!pInput)
+		return FALSE;
 	VERIFY(pInput);
 	return pInput->iGetAsyncBtnState(btn);
 }

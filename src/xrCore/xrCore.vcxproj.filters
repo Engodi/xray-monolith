@@ -4,6 +4,9 @@
     <Filter Include="Kernel">
       <UniqueIdentifier>{5c0fc163-75c9-42e2-b414-6a5d0d12cfbe}</UniqueIdentifier>
     </Filter>
+    <Filter Include="Headless">
+      <UniqueIdentifier>{7d3a5c41-2b18-4f0e-9a6c-58e2b1c94f27}</UniqueIdentifier>
+    </Filter>
     <Filter Include="Math">
       <UniqueIdentifier>{2770a42d-bbc5-4a1e-acfc-6275c24b532b}</UniqueIdentifier>
     </Filter>
@@ -140,6 +143,9 @@
     </ClCompile>
     <ClCompile Include="LocatorAPI_Notifications.cpp">
       <Filter>FS</Filter>
+    </ClCompile>
+    <ClCompile Include="headless.cpp">
+      <Filter>Headless</Filter>
     </ClCompile>
     <ClCompile Include="log.cpp">
       <Filter>FS</Filter>
@@ -436,6 +442,9 @@
     </ClInclude>
     <ClInclude Include="LocatorAPI_defs.h">
       <Filter>FS</Filter>
+    </ClInclude>
+    <ClInclude Include="headless.h">
+      <Filter>Headless</Filter>
     </ClInclude>
     <ClInclude Include="log.h">
       <Filter>FS</Filter>

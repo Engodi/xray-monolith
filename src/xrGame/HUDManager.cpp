@@ -5,6 +5,7 @@
 #include "../xrEngine/igame_level.h"
 #include "../xrEngine/xr_input.h"
 #include "../xrEngine/gamemtllib.h"
+#include "../xrCore/headless.h"
 #include "MainMenu.h"
 #include "grenade.h"
 #include "spectator.h"
@@ -127,6 +128,10 @@ CHUDManager::~CHUDManager()
 //--------------------------------------------------------------------
 void CHUDManager::OnFrame()
 {
+	// Headless (F0-04): no UI/HUD objects and no HUD frame work at all.
+	if (!Headless::UiEnabled())
+		return;
+
 	if (!psHUD_Flags.is(HUD_DRAW_RT2))
 		return;
 
@@ -424,6 +429,11 @@ extern CUIXml* g_uiSpotXml;
 
 void CHUDManager::Load()
 {
+	// Headless (F0-04): no game UI is created, the process keeps only the
+	// simulation / network part.
+	if (!Headless::UiEnabled())
+		return;
+
 	if (!pUIGame)
 	{
 		pUIGame = Game().createGameUI();
@@ -475,6 +485,10 @@ void CHUDManager::net_Relcase(CObject* obj)
 		PP.result.O = NULL;
 
 	HitMarker.net_Relcase(obj);
+
+	// Headless: the player HUD is never created (F0-04).
+	if (!g_player_hud)
+		return;
 
 	VERIFY(g_player_hud);
 	g_player_hud->net_Relcase(obj);

@@ -5,6 +5,7 @@
 #include "stdafx.h"
 #include "EngineAPI.h"
 #include "../xrcdb/xrXRC.h"
+#include "../xrCore/headless.h"
 
 //#include "securom_api.h"
 
@@ -310,6 +311,23 @@ bool /*_declspec(dllexport)*/ SupportsDX10Rendering();
 
 void CEngineAPI::CreateRendererList()
 {
+	if (Headless::Active())
+	{
+		if (vid_quality_token != NULL)
+			return;
+
+		// A single synthetic token keeps configs that set "renderer ..." valid
+		// without probing any hardware (F0-04). The renderer library is still
+		// attached in CEngineAPI::Initialize, but no device is ever created.
+		vid_quality_token = xr_alloc<xr_token>(2);
+		vid_quality_token[0].id = 0;
+		vid_quality_token[0].name = xr_strdup("renderer_null");
+		vid_quality_token[1].id = -1;
+		vid_quality_token[1].name = NULL;
+		Msg("* [headless] renderer list: renderer_null (no hardware probe)");
+		return;
+	}
+
 #ifdef DEDICATED_SERVER
 
     vid_quality_token = xr_alloc<xr_token>(2);

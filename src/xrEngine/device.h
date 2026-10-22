@@ -168,6 +168,8 @@ private:
 	void _Create(LPCSTR shName);
 	void _Destroy(BOOL bKeepTextures);
 	void _SetupStates();
+	// Headless profile (F0-04): device without a swap chain / D3D device.
+	void CreateHeadless();
 public:
 	// HWND m_hWnd;
 	LRESULT MsgProc(HWND, UINT, WPARAM, LPARAM);
@@ -475,6 +477,8 @@ public:
 
 private:
 	void message_loop();
+	// Headless profiles (F0-04): tick the game/network loop without drawing.
+	void headless_loop();
 	virtual void _BCL AddSeqFrame(pureFrame* f, bool mt);
 	virtual void _BCL RemoveSeqFrame(pureFrame* f);
 	virtual CStatsPhysics* _BCL StatPhysics() { return Statistic; }

@@ -4,6 +4,7 @@
 #include "../xrEngine/customhud.h"
 #include "../xrEngine/fdemorecord.h"
 #include "../xrEngine/fdemoplay.h"
+#include "../xrCore/headless.h"
 #include "xrMessages.h"
 #include "xrserver.h"
 #include "level.h"
@@ -1993,6 +1994,13 @@ public:
 
 	virtual void Execute(LPCSTR args)
 	{
+		// Headless (F0-04): the main menu is a UI feature and does not exist.
+		if (!Headless::UiEnabled())
+		{
+			Log("* main_menu: ignored, the UI is disabled in a headless process");
+			return;
+		}
+
 		bool bWhatToDo = TRUE;
 		if (0 == xr_strlen(args))
 		{

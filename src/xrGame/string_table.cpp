@@ -169,7 +169,8 @@ void CStringTable::ReloadLanguage()
 	refresh_npc_names();
 
 	//reload language in other UIs
-	g_hud->OnScreenResolutionChanged();
+	if (g_hud)
+		g_hud->OnScreenResolutionChanged();
 }
 
 STRING_VALUE CStringTable::ParseLine(LPCSTR str, LPCSTR skey, bool bFirst)

@@ -19,6 +19,7 @@
 #include "x_ray.h"
 #include "discord\discord.h"
 #include "render.h"
+#include "../xrCore/headless.h"
 #include <chrono>
 
 // must be defined before include of FS_impl.h
@@ -504,7 +505,7 @@ void CRenderDevice::on_idle()
 	STOP_PROFILE;
 
 #ifdef ECO_RENDER // ECO_RENDER START
-	if (Device.Paused() || IsMainMenuActive() || ps_framelimiter)
+	if (!Headless::Active() && (Device.Paused() || IsMainMenuActive() || ps_framelimiter))
 	{
 		PROF_EVENT("Eco Render");
 
@@ -532,7 +533,8 @@ void CRenderDevice::on_idle()
 	Statistic->RenderTOTAL_Real.FrameStart();
 	Statistic->RenderTOTAL_Real.Begin();
 
-	if (b_is_Active && Begin())
+	// Headless: no drawing at all, the iteration only simulates (F0-04).
+	if (!Headless::Active() && b_is_Active && Begin())
 	{
 		START_PROFILE("Process seqRender");
 		seqRender.Process(rp_Render);
@@ -624,6 +626,30 @@ void CRenderDevice::message_loop()
 	}
 }
 
+// Headless profiles (F0-04): the same message drain as message_loop(), but the
+// idle work is a pure simulation step and the loop is paced by the fixed
+// headless tick rate instead of the display refresh (no vsync, no Present).
+void CRenderDevice::headless_loop()
+{
+	MSG msg;
+	PeekMessage(&msg, NULL, 0U, 0U, PM_NOREMOVE);
+	while (msg.message != WM_QUIT)
+	{
+		if (PeekMessage(&msg, NULL, 0U, 0U, PM_REMOVE))
+		{
+			if (msg.message == WM_QUIT)
+				break;
+			TranslateMessage(&msg);
+			DispatchMessage(&msg);
+			continue;
+		}
+
+		const u32 iteration_start = TimerMM.GetElapsed_ms();
+		on_idle();
+		Headless::SleepToNextTick(TimerMM.GetElapsed_ms() - iteration_start);
+	}
+}
+
 void mt_DiscordThread(void*)
 {
 	while (true)
@@ -673,12 +699,20 @@ void CRenderDevice::Run()
 	mt_bMustExit = FALSE;
 	thread_spawn(mt_FreezeThread, "Freeze detecting thread", 0, 0);
 	thread_spawn(mt_Thread, "X-RAY Secondary thread", 0, this);
-	thread_spawn(mt_DiscordThread, "X-RAY Discord thread", 0, 0);
+	if (!Headless::Active())
+		thread_spawn(mt_DiscordThread, "X-RAY Discord thread", 0, 0);
 	// Message cycle
 	seqAppStart.Process(rp_AppStart);
-	m_pRender->ClearTarget();
-	SetForegroundWindow(m_hWnd);
-	message_loop();
+	if (Headless::Active())
+	{
+		headless_loop();
+	}
+	else
+	{
+		m_pRender->ClearTarget();
+		SetForegroundWindow(m_hWnd);
+		message_loop();
+	}
 	seqAppEnd.Process(rp_AppEnd);
 	// Stop Balance-Thread
 	mt_bMustExit = TRUE;
@@ -853,13 +887,15 @@ void CRenderDevice::OnWM_Activate(WPARAM wParam, LPARAM lParam)
 					MapWindowPoints(m_hWnd, nullptr, reinterpret_cast<LPPOINT>(&winRect), 2);
 					ClipCursor(&winRect);
 				}
-				pInput->OnAppActivate();
+				if (pInput)
+					pInput->OnAppActivate();
 			}
 			else
 			{
 				ShowCursor(TRUE);
 				ClipCursor(NULL);
-				pInput->OnAppDeactivate();
+				if (pInput)
+					pInput->OnAppDeactivate();
 			}
 		}
 

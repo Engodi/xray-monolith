@@ -293,7 +293,8 @@ void CObjectList::Update(bool bForce)
 			for (; dIt != dIte; ++dIt)
 			{
 				(*It).m_Callback(*dIt);
-				g_hud->net_Relcase(*dIt);
+				if (g_hud)
+					g_hud->net_Relcase(*dIt);
 			}
 		}
 

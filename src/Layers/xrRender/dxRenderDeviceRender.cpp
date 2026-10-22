@@ -3,6 +3,7 @@
 
 #include "ResourceManager.h"
 #include "../../xrEngine/shader_bus.h"
+#include "../../xrCore/headless.h"
 
 // a shader bus texture lane's $user$bus_ alias and the texture it shows
 struct bus_texture_slot
@@ -169,6 +170,10 @@ void dxRenderDeviceRender::Reset(HWND hWnd, u32& dwWidth, u32& dwHeight, float& 
 
 void dxRenderDeviceRender::SetupStates()
 {
+	// Headless: there is no hardware state to program (F0-04).
+	if (Headless::Active())
+		return;
+
 	HW.Caps.Update();
 
 #if defined(USE_DX10) || defined(USE_DX11)
@@ -224,6 +229,17 @@ void dxRenderDeviceRender::SetupStates()
 
 void dxRenderDeviceRender::OnDeviceCreate(LPCSTR shName)
 {
+	// Headless: the render core is created CPU-only (no device, no shaders, no
+	// textures), so the simulation can run without a GPU (F0-04, NFR-ARCH-7).
+	if (Headless::Active())
+	{
+		// No RCache buffers, no statistics font, no wire/selection shaders: they
+		// all need a device, and nothing is presented in a headless process.
+		::Render->create();
+		Msg("* [headless] render device created without GPU resources");
+		return;
+	}
+
 	// Signal everyone - device created
 	RCache.OnDeviceCreate();
 	m_Gamma.Update();
@@ -245,6 +261,18 @@ void dxRenderDeviceRender::OnDeviceCreate(LPCSTR shName)
 void dxRenderDeviceRender::Create(HWND hWnd, u32& dwWidth, u32& dwHeight, float& fWidth_2, float& fHeight_2,
                                   bool move_window)
 {
+	// Headless: never create a device or a swap chain. Only the CPU-side
+	// resource manager is allocated, which is all a simulation-only process
+	// refers to (F0-04).
+	if (Headless::Active())
+	{
+		Headless::ConfigureBackbuffer(dwWidth, dwHeight);
+		fWidth_2 = float(dwWidth) / 2;
+		fHeight_2 = float(dwHeight) / 2;
+		Resources = xr_new<CResourceManager>();
+		return;
+	}
+
 	HW.CreateDevice(hWnd, move_window);
 #if defined(USE_DX11)
 	dwWidth = HW.m_ChainDesc.Width;

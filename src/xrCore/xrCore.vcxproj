@@ -484,6 +484,7 @@
       <ExcludedFromBuild Condition="'$(Configuration)|$(Platform)'=='Release-AVX|x64'">true</ExcludedFromBuild>
     </ClCompile>
     <ClCompile Include="Lock.cpp" />
+    <ClCompile Include="headless.cpp" />
     <ClCompile Include="log.cpp" />
     <ClCompile Include="LzHuf.cpp" />
     <ClCompile Include="lzo_compressor.cpp" />
@@ -601,6 +602,7 @@
       <ExcludedFromBuild Condition="'$(Configuration)|$(Platform)'=='Release-AVX|x64'">true</ExcludedFromBuild>
     </CustomBuild>
     <ClInclude Include="Lock.hpp" />
+    <ClInclude Include="headless.h" />
     <ClInclude Include="log.h" />
     <ClInclude Include="lzhuf.h" />
     <ClInclude Include="lzo_compressor.h" />
