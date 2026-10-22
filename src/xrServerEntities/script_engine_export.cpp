@@ -22,6 +22,9 @@
 #include "ui/UIActorMenu.h"
 #include "ui/UIMainIngameWnd.h"
 #include "ui/UIPdaWnd.h"
+#ifndef XRSE_FACTORY_EXPORTS
+#	include "coop/coop_bridge_script.h"
+#endif
 
 void export_classes	(lua_State *L)
 {
@@ -29,6 +32,9 @@ void export_classes	(lua_State *L)
 	CScriptPropertiesListHelper::script_register(L);
 #else
 	CScriptEngine::script_register(L);
+
+	// F0-05: coop Lua bridge (engine <-> Lua adapter, game build only).
+	coop_bridge_registrator::script_register(L);
 
 	CScriptNetPacket::script_register(L);
 	CScriptFcolor::script_register(L);

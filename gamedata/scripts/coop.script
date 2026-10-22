@@ -1,0 +1,292 @@
+--[[
+	coop.script — публичный Lua-фасад coop-режима (задача F0-05).
+
+	Слой: геймплей (gamedata/scripts). Движковая часть моста живёт в C++
+	(coop_bridge, src/xrGame/coop/): сессия, роли, паритет экспортов,
+	счётчики, debug-флаги. Здесь — только события/решения и примитивы
+	для мод-слоя (US-2.10, NFR-ARCH-10).
+
+	Инварианты:
+	* одиночная игра не ломается: если движкового моста нет (vanilla-сборка),
+	  слой работает в offline-режиме и не падает;
+	* клиент не пишет авторитетное состояние — это проверяет coop_sync;
+	* debug-поверхность (PLAN 8.11) выключена по умолчанию и включается
+	  только при запуске движка с параметром -coop_debug.
+]]
+
+coop = coop or {}
+
+coop.VERSION = 1
+coop.API_VERSION = 1
+coop.CONFIG_PATH = "coop\\coop.ltx"
+coop.DEBUG_PARAM = "-coop_debug"
+
+-- Константы тюнинга (переопределяются [coop] в coop\coop.ltx).
+coop.DEFAULT_EVENT_PULSE_MS = 250
+coop.DEFAULT_MOVE_THRESHOLD = 0.15
+coop.DEFAULT_REQUEST_TIMEOUT_MS = 5000
+
+-- Единый реестр Lua-половины API (сверка паритета хост<->клиент).
+-- name  — публичное имя (путь от таблицы coop),
+-- argc  — число фиксированных аргументов,
+-- since — версия API, с которой существует вызов.
+coop.api = {
+	{ name = "_set_role", argc = 2, since = 1 },
+	{ name = "api_fingerprint", argc = 0, since = 1 },
+	{ name = "debug.alife_enabled", argc = 0, since = 1 },
+	{ name = "debug.command", argc = 1, since = 1 },
+	{ name = "debug.enable", argc = 1, since = 1 },
+	{ name = "debug.enabled", argc = 0, since = 1 },
+	{ name = "debug.god_mode", argc = 1, since = 1 },
+	{ name = "debug.reset", argc = 0, since = 1 },
+	{ name = "debug.set_alife", argc = 1, since = 1 },
+	{ name = "debug.spawn", argc = 4, since = 1 },
+	{ name = "debug.spawn_item", argc = 4, since = 1 },
+	{ name = "debug.spawn_npc", argc = 4, since = 1 },
+	{ name = "debug.status", argc = 0, since = 1 },
+	{ name = "debug.teleport", argc = 3, since = 1 },
+	{ name = "debug.teleport_to_object", argc = 1, since = 1 },
+	{ name = "describe", argc = 0, since = 1 },
+	{ name = "events.decode", argc = 1, since = 1 },
+	{ name = "events.emit", argc = 2, since = 1 },
+	{ name = "events.encode", argc = 1, since = 1 },
+	{ name = "events.off", argc = 2, since = 1 },
+	{ name = "events.on", argc = 2, since = 1 },
+	{ name = "events.pulse", argc = 1, since = 1 },
+	{ name = "is_client", argc = 0, since = 1 },
+	{ name = "is_host", argc = 0, since = 1 },
+	{ name = "is_offline", argc = 0, since = 1 },
+	{ name = "parity.describe", argc = 1, since = 1 },
+	{ name = "parity.fingerprint", argc = 1, since = 1 },
+	{ name = "parity.handshake", argc = 1, since = 1 },
+	{ name = "parity.local_fingerprint", argc = 0, since = 1 },
+	{ name = "parity.local_manifest", argc = 0, since = 1 },
+	{ name = "parity.parse", argc = 1, since = 1 },
+	{ name = "parity.payload", argc = 0, since = 1 },
+	{ name = "parity.serialize", argc = 1, since = 1 },
+	{ name = "parity.verify", argc = 1, since = 1 },
+	{ name = "role", argc = 0, since = 1 },
+	{ name = "session", argc = 0, since = 1 },
+	{ name = "sync.get_state", argc = 3, since = 1 },
+	{ name = "sync.handle", argc = 2, since = 1 },
+	{ name = "sync.off", argc = 2, since = 1 },
+	{ name = "sync.on", argc = 2, since = 1 },
+	{ name = "sync.publish", argc = 2, since = 1 },
+	{ name = "sync.pump", argc = 0, since = 1 },
+	{ name = "sync.register", argc = 2, since = 1 },
+	{ name = "sync.request", argc = 3, since = 1 },
+	{ name = "sync.set_state", argc = 3, since = 1 },
+	{ name = "sync.snapshot", argc = 1, since = 1 },
+	{ name = "sync.stats", argc = 0, since = 1 },
+}
+
+local config_cache = nil
+
+local function load_config()
+	if config_cache ~= nil then
+		return config_cache
+	end
+
+	config_cache = {}
+
+	if type(ini_file_ex) ~= "function" then
+		return config_cache
+	end
+
+	local ok, ini = pcall(ini_file_ex, coop.CONFIG_PATH, false)
+	if not ok or ini == nil then
+		return config_cache
+	end
+
+	local function read_number(key, fallback)
+		local ok_value, value = pcall(function()
+			return ini:r_float_ex("coop", key, fallback)
+		end)
+		if ok_value and type(value) == "number" then
+			return value
+		end
+		return fallback
+	end
+
+	config_cache.event_pulse_ms = read_number("event_pulse_ms", coop.DEFAULT_EVENT_PULSE_MS)
+	config_cache.move_threshold = read_number("move_threshold", coop.DEFAULT_MOVE_THRESHOLD)
+	config_cache.request_timeout_ms = read_number("request_timeout_ms", coop.DEFAULT_REQUEST_TIMEOUT_MS)
+
+	return config_cache
+end
+
+-- Возвращает движковую таблицу coop_bridge или nil (vanilla-движок).
+function coop.bridge()
+	if type(coop_bridge) == "table" then
+		return coop_bridge
+	end
+	return nil
+end
+
+function coop.is_available()
+	return coop.bridge() ~= nil
+end
+
+function coop.config(key, fallback)
+	local config = load_config()
+	local value = config[key]
+	if value == nil then
+		return fallback
+	end
+	return value
+end
+
+function coop.command_line()
+	if type(level) ~= "table" and type(level) ~= "userdata" then
+		return ""
+	end
+
+	local ok, line = pcall(function()
+		return level.command_line()
+	end)
+	if ok and type(line) == "string" then
+		return line
+	end
+	return ""
+end
+
+-- Включать debug-поверхность можно только при старте движка с -coop_debug.
+-- Проверка по целым токенам, чтобы "-coop_debug_x" не считался совпадением.
+function coop.launcher_allows_debug()
+	local line = coop.command_line()
+	for token in string.gmatch(line, "%S+") do
+		if token == coop.DEBUG_PARAM then
+			return true
+		end
+	end
+	return false
+end
+
+function coop.log(message)
+	local text = "[coop] " .. tostring(message)
+	if type(printf) == "function" then
+		printf(text)
+	elseif type(print) == "function" then
+		print(text)
+	end
+end
+
+-- --- сессия/роль -----------------------------------------------------------
+-- Роль выставляет менеджер соединений (F0-08). До него — offline.
+-- Прямая смена роли из скриптов запрещена вне debug-режима (AC-2.10.2).
+
+function coop.role()
+	local bridge = coop.bridge()
+	if bridge == nil then
+		return "offline"
+	end
+	return bridge.role()
+end
+
+function coop.is_host()
+	return coop.role() == "host"
+end
+
+function coop.is_client()
+	return coop.role() == "client"
+end
+
+function coop.is_offline()
+	return coop.role() == "offline"
+end
+
+function coop.session()
+	local bridge = coop.bridge()
+	if bridge == nil then
+		return {
+			role = "offline",
+			role_id = 0,
+			local_player = 0,
+			peer_count = 0,
+			max_slots = 0,
+			api_version = coop.API_VERSION,
+			loopback = false,
+			inbound = 0,
+			bridge = false,
+		}
+	end
+
+	local session = bridge.session()
+	session.bridge = true
+	return session
+end
+
+function coop._set_role(role, local_player)
+	local bridge = coop.bridge()
+	if bridge == nil then
+		return false, "no_bridge"
+	end
+
+	if not coop.launcher_allows_debug() then
+		coop.log("set_role rejected: role changes belong to the session manager (F0-08)")
+		return false, "not_allowed"
+	end
+
+	local ok = bridge.set_role(role, local_player or 0)
+	if not ok then
+		return false, bridge.last_error()
+	end
+	return true
+end
+
+function coop.api_fingerprint()
+	local bridge = coop.bridge()
+	if bridge == nil then
+		return "0000000000000000"
+	end
+	return bridge.api_fingerprint()
+end
+
+function coop.describe()
+	return {
+		version = coop.VERSION,
+		api_version = coop.API_VERSION,
+		role = coop.role(),
+		available = coop.is_available(),
+		debug_allowed = coop.launcher_allows_debug(),
+		config = coop.CONFIG_PATH,
+	}
+end
+
+-- --- инициализация ---------------------------------------------------------
+
+local initialized = false
+
+function coop.init()
+	local bridge = coop.bridge()
+	if bridge ~= nil then
+		-- Сообщения из сети приходят только по факту — никакого покадрового
+		-- маршаллинга C++->Lua (NFR-ARCH-10).
+		bridge.enable_dispatch()
+	end
+
+	if not initialized then
+		initialized = true
+		coop.log(
+			string.format(
+				"bridge init: available=%s role=%s api=%s",
+				tostring(coop.is_available()),
+				coop.role(),
+				coop.api_fingerprint()
+			)
+		)
+	end
+	return true
+end
+
+function coop.reset()
+	local bridge = coop.bridge()
+	if bridge ~= nil then
+		bridge.clear()
+	end
+	config_cache = nil
+end
+
+function coop.on_game_start()
+	coop.init()
+end

@@ -22,6 +22,7 @@
 #include "restriction_space.h"
 #include "profiler.h"
 #include "mt_config.h"
+#include "coop/coop_bridge.h"
 
 using namespace ALife;
 #ifdef	ENGINE_LUA_ALIFE_UPDAGE_MANAGER_CALLBACKS
@@ -112,6 +113,11 @@ void CALifeUpdateManager::update_scheduled(bool init_ef)
 
 void CALifeUpdateManager::update()
 {
+	// F0-05 debug surface (PLAN 8.11): A-Life freeze for deterministic bot runs.
+	// Debug-only, enabled by coop_debug Lua commands, on by default (no freeze).
+	if (!coop::bridge().alife_enabled())
+		return;
+
 	update_switch();
 	update_scheduled(false);
 }

@@ -2497,6 +2497,9 @@
     <Filter Include="UI\Common\ImGui">
       <UniqueIdentifier>{c14ffa0c-947d-49b9-8e01-269569b48371}</UniqueIdentifier>
     </Filter>
+    <Filter Include="Coop">
+      <UniqueIdentifier>{7f3c2a10-5b64-4d8e-9a21-0c4d5e6f7a8b}</UniqueIdentifier>
+    </Filter>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="mt_config.h">
@@ -5168,6 +5171,12 @@
     </ClInclude>
     <ClInclude Include="shader_bus_script.h">
       <Filter>AI\AScript\ScriptClasses\Console</Filter>
+    </ClInclude>
+    <ClInclude Include="coop\coop_bridge.h">
+      <Filter>Coop</Filter>
+    </ClInclude>
+    <ClInclude Include="coop\coop_bridge_script.h">
+      <Filter>Coop</Filter>
     </ClInclude>
     <ClInclude Include="base_client_classes.h">
       <Filter>AI\AScript\ScriptClasses\BaseClientClasses</Filter>
@@ -8797,6 +8806,12 @@
     </ClCompile>
     <ClCompile Include="shader_bus_script.cpp">
       <Filter>AI\AScript\ScriptClasses\Console</Filter>
+    </ClCompile>
+    <ClCompile Include="coop\coop_bridge.cpp">
+      <Filter>Coop</Filter>
+    </ClCompile>
+    <ClCompile Include="coop\coop_bridge_script.cpp">
+      <Filter>Coop</Filter>
     </ClCompile>
     <ClCompile Include="base_client_classes_script.cpp">
       <Filter>AI\AScript\ScriptClasses\BaseClientClasses</Filter>

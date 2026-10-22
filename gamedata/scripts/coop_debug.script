@@ -1,0 +1,336 @@
+--[[
+	coop_debug.script — debug-поверхность для ботов/e2e (F0-05, PLAN §8.11).
+
+	Механики:
+	  * A-Life on/off — детерминированный прогон без «шума» NPC;
+	  * телепорт игрока — позиция/объект;
+	  * god-mode — бессмертие актора;
+	  * принудительный спавн NPC/предметов по секции.
+
+	Безопасность: всё выключено по умолчанию. Включить поверхность можно
+	только при запуске движка с параметром -coop_debug (проверка в
+	coop.launcher_allows_debug). В прод-пути игрока команды недоступны:
+	каждая отклоняется с записью в лог и не меняет состояние мира.
+
+	Потребители: Lua-сценарии ботов (F0-12) и e2e (F1-14).
+]]
+
+coop_debug = coop_debug or {}
+
+local D = coop_debug
+
+local function log(message)
+	if coop ~= nil and type(coop.log) == "function" then
+		coop.log(message)
+	end
+end
+
+local function bridge()
+	if coop ~= nil and type(coop.bridge) == "function" then
+		return coop.bridge()
+	end
+	return nil
+end
+
+local function actor()
+	if type(db) == "table" and db.actor ~= nil then
+		return db.actor
+	end
+	return nil
+end
+
+local function guard(command_name)
+	local adapter = bridge()
+	if adapter == nil then
+		return false, "no_bridge"
+	end
+	if not adapter.debug_enabled() then
+		log(string.format("debug command '%s' rejected: debug surface is disabled", tostring(command_name)))
+		return false, "debug_disabled"
+	end
+	return true
+end
+
+local function apply_god_mode()
+	local adapter = bridge()
+	local current_actor = actor()
+	if adapter == nil or current_actor == nil then
+		return false
+	end
+
+	local enabled = adapter.god_mode() == true
+	local ok = pcall(function()
+		current_actor:invulnerable(enabled)
+	end)
+	return ok
+end
+
+function D.enabled()
+	local adapter = bridge()
+	return adapter ~= nil and adapter.debug_enabled() == true
+end
+
+function D.enable(enabled)
+	local adapter = bridge()
+	if adapter == nil then
+		return false, "no_bridge"
+	end
+
+	local allowed = false
+	if coop ~= nil and type(coop.launcher_allows_debug) == "function" then
+		allowed = coop.launcher_allows_debug()
+	end
+
+	local ok = adapter.set_debug_enabled(enabled == true, allowed)
+	if not ok then
+		return false, adapter.last_error()
+	end
+
+	if enabled ~= true then
+		apply_god_mode()
+	end
+
+	log(string.format("debug surface %s", enabled == true and "enabled" or "disabled"))
+	return true
+end
+
+function D.alife_enabled()
+	local adapter = bridge()
+	if adapter == nil then
+		return true
+	end
+	return adapter.alife_enabled()
+end
+
+function D.set_alife(enabled)
+	local ok, reason = guard("set_alife")
+	if not ok then
+		return false, reason
+	end
+
+	local adapter = bridge()
+	if not adapter.set_alife_enabled(enabled == true) then
+		return false, adapter.last_error()
+	end
+
+	log(string.format("A-Life simulation %s", enabled == true and "enabled" or "disabled"))
+	return true
+end
+
+function D.god_mode(enabled)
+	local ok, reason = guard("god_mode")
+	if not ok then
+		return false, reason
+	end
+
+	local adapter = bridge()
+	if not adapter.set_god_mode(enabled == true) then
+		return false, adapter.last_error()
+	end
+
+	apply_god_mode()
+	return true
+end
+
+function D.teleport(x, y, z)
+	local ok, reason = guard("teleport")
+	if not ok then
+		return false, reason
+	end
+
+	if type(x) ~= "number" or type(y) ~= "number" or type(z) ~= "number" then
+		return false, "invalid_position"
+	end
+
+	local current_actor = actor()
+	if current_actor == nil then
+		return false, "no_actor"
+	end
+
+	local moved = pcall(function()
+		current_actor:set_actor_position(vector():set(x, y, z), false, false)
+	end)
+	if not moved then
+		return false, "teleport_failed"
+	end
+
+	return true
+end
+
+function D.teleport_to_object(object_id)
+	local ok, reason = guard("teleport_to_object")
+	if not ok then
+		return false, reason
+	end
+
+	if type(level) ~= "table" and type(level) ~= "userdata" then
+		return false, "no_level"
+	end
+
+	local target = nil
+	local found = pcall(function()
+		target = level.object_by_id(object_id)
+	end)
+	if not found or target == nil then
+		return false, "object_not_found"
+	end
+
+	local position = nil
+	local positioned = pcall(function()
+		position = target:position()
+	end)
+	if not positioned or position == nil then
+		return false, "object_without_position"
+	end
+
+	return D.teleport(position.x, position.y, position.z)
+end
+
+function D.spawn(section, x, y, z)
+	local ok, reason = guard("spawn")
+	if not ok then
+		return false, reason
+	end
+
+	if type(section) ~= "string" or section == "" then
+		return false, "invalid_section"
+	end
+	if type(x) ~= "number" or type(y) ~= "number" or type(z) ~= "number" then
+		return false, "invalid_position"
+	end
+	if type(alife) ~= "function" then
+		return false, "no_alife"
+	end
+
+	local current_actor = actor()
+	if current_actor == nil then
+		return false, "no_actor"
+	end
+
+	local level_vertex_id = nil
+	local game_vertex_id = nil
+	pcall(function()
+		level_vertex_id = current_actor:level_vertex_id()
+		game_vertex_id = current_actor:game_vertex_id()
+	end)
+
+	if level_vertex_id == nil or game_vertex_id == nil then
+		return false, "no_vertex"
+	end
+
+	local created = nil
+	local spawned = pcall(function()
+		created = alife():create(section, vector():set(x, y, z), level_vertex_id, game_vertex_id)
+	end)
+	if not spawned or created == nil then
+		return false, "spawn_failed"
+	end
+
+	local object_id = nil
+	pcall(function()
+		object_id = created.id
+	end)
+
+	return true, object_id
+end
+
+function D.spawn_item(section, x, y, z)
+	return D.spawn(section, x, y, z)
+end
+
+function D.spawn_npc(section, x, y, z)
+	return D.spawn(section, x, y, z)
+end
+
+function D.status()
+	local adapter = bridge()
+	if adapter == nil then
+		return {
+			available = false,
+			enabled = false,
+			alife_enabled = true,
+			god_mode = false,
+			debug_allowed = false,
+		}
+	end
+
+	local allowed = false
+	if coop ~= nil and type(coop.launcher_allows_debug) == "function" then
+		allowed = coop.launcher_allows_debug()
+	end
+
+	return {
+		available = true,
+		enabled = adapter.debug_enabled() == true,
+		alife_enabled = adapter.alife_enabled() == true,
+		god_mode = adapter.god_mode() == true,
+		debug_allowed = allowed,
+	}
+end
+
+function D.reset()
+	local adapter = bridge()
+	if adapter == nil then
+		return false, "no_bridge"
+	end
+
+	adapter.set_god_mode(false)
+	adapter.set_alife_enabled(true)
+	adapter.set_debug_enabled(false, true)
+	apply_god_mode()
+	return true
+end
+
+local commands = {
+	alife = function(enabled)
+		return D.set_alife(enabled)
+	end,
+	enable = function(enabled)
+		return D.enable(enabled)
+	end,
+	god = function(enabled)
+		return D.god_mode(enabled)
+	end,
+	reset = function()
+		return D.reset()
+	end,
+	spawn = function(section, x, y, z)
+		return D.spawn(section, x, y, z)
+	end,
+	status = function()
+		return D.status()
+	end,
+	teleport = function(x, y, z)
+		return D.teleport(x, y, z)
+	end,
+	teleport_to_object = function(object_id)
+		return D.teleport_to_object(object_id)
+	end,
+}
+
+-- Диспетчер для декларативных бот-сценариев: coop.debug.command("god", true).
+function D.command(name, ...)
+	local command = commands[name]
+	if command == nil then
+		return false, "unknown_command"
+	end
+	return command(...)
+end
+
+function D.on_actor_first_update(_binder)
+	local adapter = bridge()
+	if adapter ~= nil and adapter.god_mode() == true then
+		apply_god_mode()
+	end
+end
+
+function D.on_game_start()
+	if type(RegisterScriptCallback) == "function" then
+		RegisterScriptCallback("actor_on_first_update", D.on_actor_first_update)
+	end
+end
+
+-- Публичный фасад: coop.debug.*
+if coop ~= nil then
+	coop.debug = D
+end

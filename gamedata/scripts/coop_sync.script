@@ -1,0 +1,567 @@
+--[[
+	coop_sync.script — примитивы синхронизации для мод-слоя (F0-05, US-2.10).
+
+	Что даёт мод-автору без правки coop-ядра:
+	  * coop.sync.register(channel, { writer = "host" }) — объявить канал;
+	  * coop.sync.publish(channel, payload) — отправить данные;
+	  * coop.sync.request(channel, payload, cb) — запрос клиент->хост с ответом;
+	  * coop.sync.set_state / get_state / snapshot — авторитетное состояние
+	    канала с single-writer (пишет только владелец канала);
+	  * coop.sync.on(channel, fn) — подписка на изменения.
+
+	Инварианты:
+	  * клиент не пишет состояние канала с writer="host": вызов отклоняется,
+	    ошибка логируется, состояние остаётся прежним (AC-2.10.2);
+	  * при отсутствии сессии (offline) publish/request возвращают ошибку,
+	    локальное состояние при этом продолжает работать (одиночная игра).
+]]
+
+coop_sync = coop_sync or {}
+
+local S = coop_sync
+
+local function log(message)
+	if coop ~= nil and type(coop.log) == "function" then
+		coop.log(message)
+	end
+end
+
+local function events()
+	if coop_events ~= nil and type(coop_events.encode) == "function" then
+		return coop_events
+	end
+	return nil
+end
+
+local function bridge()
+	if coop ~= nil and type(coop.bridge) == "function" then
+		return coop.bridge()
+	end
+	return nil
+end
+
+local function is_host()
+	if coop ~= nil and type(coop.is_host) == "function" then
+		return coop.is_host()
+	end
+	local adapter = bridge()
+	return adapter ~= nil and adapter.is_host() == true
+end
+
+local function is_offline()
+	if coop ~= nil and type(coop.is_offline) == "function" then
+		return coop.is_offline()
+	end
+	local adapter = bridge()
+	return adapter == nil or adapter.is_offline() == true
+end
+
+local function now()
+	if type(time_global) == "function" then
+		return time_global()
+	end
+	return 0
+end
+
+S.WRITER_HOST = "host"
+S.WRITER_ANY = "any"
+
+S.CHANNEL_STATE = "coop.state"
+S.CHANNEL_REQUEST = "coop.request"
+S.CHANNEL_RESPONSE = "coop.response"
+
+local channels = {}
+local subscribers = {}
+local state_cache = {}
+local pending = {}
+local next_request_id = 0
+local stats = {
+	sent = 0,
+	received = 0,
+	rejected = 0,
+	timeouts = 0,
+}
+
+local function count_pending()
+	local total = 0
+	for _ in pairs(pending) do
+		total = total + 1
+	end
+	return total
+end
+
+local function count_channels()
+	local total = 0
+	for _ in pairs(channels) do
+		total = total + 1
+	end
+	return total
+end
+
+local function encode(payload)
+	local codec = events()
+	if codec == nil then
+		return nil, "codec_unavailable"
+	end
+	return codec.encode(payload)
+end
+
+local function decode(payload)
+	local codec = events()
+	if codec == nil then
+		return nil, "codec_unavailable"
+	end
+	return codec.decode(payload)
+end
+
+local function subscribe(channel, callback)
+	local list = subscribers[channel]
+	if list == nil then
+		list = {}
+		subscribers[channel] = list
+	end
+	for index = 1, #list do
+		if list[index] == callback then
+			return false
+		end
+	end
+	list[#list + 1] = callback
+	return true
+end
+
+local function dispatch(channel, payload)
+	local list = subscribers[channel]
+	if list == nil then
+		return 0
+	end
+
+	local delivered = 0
+	for index = 1, #list do
+		local ok, error_message = pcall(list[index], payload, channel)
+		if ok then
+			delivered = delivered + 1
+		else
+			log(string.format("sync handler failed for %s: %s", tostring(channel), tostring(error_message)))
+		end
+	end
+	return delivered
+end
+
+local function reject(channel, reason)
+	stats.rejected = stats.rejected + 1
+	log(string.format("sync rejected on '%s': %s", tostring(channel), tostring(reason)))
+	return false, reason
+end
+
+function S.register(channel, options)
+	if type(channel) ~= "string" or channel == "" then
+		return false, "invalid_channel"
+	end
+
+	options = options or {}
+	local writer = options.writer or S.WRITER_HOST
+	if writer ~= S.WRITER_HOST and writer ~= S.WRITER_ANY then
+		return false, "invalid_writer"
+	end
+
+	local existing = channels[channel]
+	if existing ~= nil then
+		if existing.writer ~= writer then
+			return false, "already_registered"
+		end
+		return true
+	end
+
+	channels[channel] = { writer = writer, handler = nil }
+	if state_cache[channel] == nil then
+		state_cache[channel] = {}
+	end
+	return true
+end
+
+function S.handle(channel, handler)
+	local definition = channels[channel]
+	if definition == nil then
+		return false, "unknown_channel"
+	end
+	if type(handler) ~= "function" then
+		return false, "invalid_handler"
+	end
+	definition.handler = handler
+	return true
+end
+
+function S.on(channel, callback)
+	if type(channel) ~= "string" or channel == "" then
+		return false, "invalid_channel"
+	end
+	if type(callback) ~= "function" then
+		return false, "invalid_callback"
+	end
+	return subscribe(channel, callback)
+end
+
+function S.off(channel, callback)
+	local list = subscribers[channel]
+	if list == nil then
+		return false
+	end
+	for index = #list, 1, -1 do
+		if list[index] == callback then
+			table.remove(list, index)
+			return true
+		end
+	end
+	return false
+end
+
+local function authority(channel)
+	local definition = channels[channel]
+	if definition == nil then
+		return nil, "unknown_channel"
+	end
+	if definition.writer == S.WRITER_ANY then
+		return definition
+	end
+	if not is_host() then
+		return nil, "not_authority"
+	end
+	return definition
+end
+
+function S.publish(channel, payload)
+	local definition, reason = authority(channel)
+	if definition == nil then
+		return reject(channel, reason)
+	end
+
+	local adapter = bridge()
+	if adapter == nil then
+		return reject(channel, "no_bridge")
+	end
+	if is_offline() then
+		return reject(channel, "not_connected")
+	end
+
+	local encoded = nil
+	if type(payload) == "string" then
+		encoded = payload
+	else
+		local encode_error
+		encoded, encode_error = encode(payload or {})
+		if encoded == nil then
+			return reject(channel, encode_error)
+		end
+	end
+
+	local sequence = adapter.sync(channel, encoded)
+	if sequence == 0 then
+		return reject(channel, adapter.last_error())
+	end
+
+	stats.sent = stats.sent + 1
+	return true, sequence
+end
+
+function S.request(channel, payload, callback)
+	local definition = channels[channel]
+	if definition == nil then
+		return reject(channel, "unknown_channel")
+	end
+
+	local adapter = bridge()
+	if adapter == nil then
+		return reject(channel, "no_bridge")
+	end
+	if is_offline() then
+		return reject(channel, "not_connected")
+	end
+	if type(callback) ~= "function" then
+		return reject(channel, "invalid_callback")
+	end
+
+	local encoded = nil
+	if type(payload) == "string" then
+		encoded = payload
+	else
+		local encode_error
+		encoded, encode_error = encode(payload or {})
+		if encoded == nil then
+			return reject(channel, encode_error)
+		end
+	end
+
+	next_request_id = next_request_id + 1
+	local request_id = next_request_id
+
+	local timeout = 0
+	if coop ~= nil and type(coop.config) == "function" then
+		timeout = coop.config("request_timeout_ms", 5000)
+	else
+		timeout = 5000
+	end
+
+	pending[request_id] = {
+		callback = callback,
+		deadline = now() + timeout,
+		channel = channel,
+	}
+
+	local envelope, envelope_error = encode({
+		id = request_id,
+		channel = channel,
+		payload = encoded,
+	})
+	if envelope == nil then
+		pending[request_id] = nil
+		return reject(channel, envelope_error)
+	end
+
+	local sequence = adapter.sync(S.CHANNEL_REQUEST, envelope)
+	if sequence == 0 then
+		pending[request_id] = nil
+		return reject(channel, adapter.last_error())
+	end
+
+	stats.sent = stats.sent + 1
+	return true, request_id
+end
+
+function S.set_state(channel, key, value)
+	local definition, reason = authority(channel)
+	if definition == nil then
+		return reject(channel, reason)
+	end
+	if type(key) ~= "string" or key == "" then
+		return reject(channel, "invalid_key")
+	end
+
+	local value_type = type(value)
+	if value_type ~= "number" and value_type ~= "string" and value_type ~= "boolean" then
+		return reject(channel, "unsupported_value_type:" .. value_type)
+	end
+
+	if state_cache[channel] == nil then
+		state_cache[channel] = {}
+	end
+	state_cache[channel][key] = value
+
+	dispatch(channel, { channel = channel, key = key, value = value, local_write = true })
+
+	local adapter = bridge()
+	if adapter ~= nil and not is_offline() then
+		local envelope = encode({ channel = channel, key = key, value = value })
+		if envelope ~= nil then
+			adapter.sync(S.CHANNEL_STATE, envelope)
+		end
+	end
+
+	return true
+end
+
+function S.get_state(channel, key, fallback)
+	local cache = state_cache[channel]
+	if cache == nil then
+		return fallback
+	end
+	local value = cache[key]
+	if value == nil then
+		return fallback
+	end
+	return value
+end
+
+function S.snapshot(channel)
+	local cache = state_cache[channel]
+	if cache == nil then
+		return {}
+	end
+
+	local copy = {}
+	for key, value in pairs(cache) do
+		copy[key] = value
+	end
+	return copy
+end
+
+local function expire_pending()
+	local moment = now()
+	for request_id, request in pairs(pending) do
+		if moment >= request.deadline then
+			pending[request_id] = nil
+			stats.timeouts = stats.timeouts + 1
+			local ok, error_message = pcall(request.callback, nil, "timeout")
+			if not ok then
+				log("request timeout handler failed: " .. tostring(error_message))
+			end
+		end
+	end
+end
+
+local function handle_state(payload)
+	local message, error_message = decode(payload)
+	if message == nil or type(message.channel) ~= "string" then
+		log("malformed coop.state payload: " .. tostring(error_message))
+		return false
+	end
+
+	if state_cache[message.channel] == nil then
+		state_cache[message.channel] = {}
+	end
+	state_cache[message.channel][message.key] = message.value
+	dispatch(message.channel, message)
+	return true
+end
+
+local function handle_request(payload)
+	local message, error_message = decode(payload)
+	if message == nil or type(message.channel) ~= "string" then
+		log("malformed coop.request payload: " .. tostring(error_message))
+		return false
+	end
+
+	local definition = channels[message.channel]
+	local response = { id = message.id }
+
+	if definition == nil or definition.handler == nil then
+		response.ok = false
+		response.payload = "no_handler"
+	else
+		local ok, result = pcall(definition.handler, message.payload, message.channel)
+		response.ok = ok
+		if ok then
+			if type(result) == "table" then
+				local encoded = encode(result)
+				response.payload = encoded or ""
+			elseif result ~= nil then
+				response.payload = tostring(result)
+			else
+				response.payload = ""
+			end
+		else
+			response.payload = tostring(result)
+		end
+	end
+
+	local adapter = bridge()
+	if adapter == nil then
+		return false
+	end
+
+	local envelope = encode(response)
+	if envelope == nil then
+		return false
+	end
+	adapter.sync(S.CHANNEL_RESPONSE, envelope)
+	stats.sent = stats.sent + 1
+	return true
+end
+
+local function handle_response(payload)
+	local message, error_message = decode(payload)
+	if message == nil or message.id == nil then
+		log("malformed coop.response payload: " .. tostring(error_message))
+		return false
+	end
+
+	local request = pending[message.id]
+	if request == nil then
+		return false
+	end
+	pending[message.id] = nil
+
+	local result = message.payload
+	if type(result) == "string" and result ~= "" then
+		local decoded = decode(result)
+		if decoded ~= nil then
+			result = decoded
+		end
+	end
+
+	if message.ok == false then
+		local ok, error_message_runtime = pcall(request.callback, nil, tostring(result), false)
+		if not ok then
+			log("request response handler failed: " .. tostring(error_message_runtime))
+		end
+		return true
+	end
+
+	local ok, error_message_runtime = pcall(request.callback, result, nil, true)
+	if not ok then
+		log("request response handler failed: " .. tostring(error_message_runtime))
+	end
+	return true
+end
+
+-- Единая точка приёма из coop_bridge (C++ dispatch hook).
+function S.on_inbound(channel, payload, sequence)
+	if type(channel) ~= "string" then
+		return false
+	end
+
+	stats.received = stats.received + 1
+
+	if channel == S.CHANNEL_STATE then
+		return handle_state(payload)
+	end
+	if channel == S.CHANNEL_REQUEST then
+		return handle_request(payload)
+	end
+	if channel == S.CHANNEL_RESPONSE then
+		return handle_response(payload)
+	end
+
+	local decoded, error_message = decode(payload)
+	if decoded == nil then
+		log(string.format("malformed sync payload on '%s': %s", channel, tostring(error_message)))
+		return false
+	end
+
+	dispatch(channel, decoded)
+
+	-- Сетевые события попадают в тот же поток, что и локальные движковые:
+	-- мод-автор подписывается один раз через coop.events.on.
+	local bus = coop_events
+	if bus ~= nil and type(bus.dispatch) == "function" and bus.KNOWN ~= nil and bus.KNOWN[channel] then
+		bus.dispatch(channel, decoded)
+	end
+	return true
+end
+
+function S.pump()
+	expire_pending()
+	local adapter = bridge()
+	if adapter == nil then
+		return 0
+	end
+	return adapter.pump()
+end
+
+function S.stats()
+	return {
+		sent = stats.sent,
+		received = stats.received,
+		rejected = stats.rejected,
+		timeouts = stats.timeouts,
+		pending = count_pending(),
+		channels = count_channels(),
+	}
+end
+
+function S.reset()
+	channels = {}
+	subscribers = {}
+	state_cache = {}
+	pending = {}
+	next_request_id = 0
+	stats = { sent = 0, received = 0, rejected = 0, timeouts = 0 }
+end
+
+function S.on_game_start()
+	S.register(S.CHANNEL_STATE, { writer = S.WRITER_ANY })
+end
+
+-- Публичный фасад: coop.sync.*
+if coop ~= nil then
+	coop.sync = S
+end

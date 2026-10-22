@@ -1,0 +1,577 @@
+--[[
+	coop_events.script — нормализованный поток событий игрока/мира (F0-05).
+
+	События Фазы 0 (минимальный набор сущностей):
+	  player_move, player_health, player_inventory, item_pickup,
+	  player_death, npc_spawn, npc_death, world_time, weather, actor_spawn.
+
+	Источник — штатные колбэки Anomaly (axr_main). События видны в Lua на
+	обеих сторонах: хост и клиент подписываются на одни и те же движковые
+	колбэки, а сетевые события приходят через coop_sync.on_inbound.
+
+	NFR-ARCH-10: перемещение/HP/время/погода опрашиваются одним throttle-тиком
+	(по умолчанию 250 мс) и отправляются в C++ только при изменении значения.
+	Покадрового маршаллинга нет: actor_on_update лишь накапливает время.
+]]
+
+coop_events = coop_events or {}
+
+local E = coop_events
+
+E.NAME = {
+	ACTOR_SPAWN = "actor_spawn",
+	ITEM_PICKUP = "item_pickup",
+	NPC_DEATH = "npc_death",
+	NPC_SPAWN = "npc_spawn",
+	PLAYER_DEATH = "player_death",
+	PLAYER_HEALTH = "player_health",
+	PLAYER_INVENTORY = "player_inventory",
+	PLAYER_MOVE = "player_move",
+	WEATHER = "weather",
+	WORLD_TIME = "world_time",
+}
+
+E.KNOWN = {}
+for _, event_name in pairs(E.NAME) do
+	E.KNOWN[event_name] = true
+end
+
+local subscribers = {}
+local emit_depth = 0
+
+local TYPE_PREFIX = {
+	number = "n",
+	string = "s",
+	boolean = "b",
+}
+
+local function escape(text)
+	text = tostring(text)
+	text = text:gsub("\\", "\\\\")
+	text = text:gsub("\n", "\\n")
+	text = text:gsub("=", "\\=")
+	return text
+end
+
+local function unescape(text)
+	local out = {}
+	local index = 1
+	local length = #text
+	while index <= length do
+		local char = text:sub(index, index)
+		if char == "\\" then
+			local next_char = text:sub(index + 1, index + 1)
+			if next_char == "n" then
+				out[#out + 1] = "\n"
+			elseif next_char == "\\" then
+				out[#out + 1] = "\\"
+			elseif next_char == "=" then
+				out[#out + 1] = "="
+			else
+				out[#out + 1] = next_char
+			end
+			index = index + 2
+		else
+			out[#out + 1] = char
+			index = index + 1
+		end
+	end
+	return table.concat(out)
+end
+
+local function split_unescaped(text, separator)
+	local index = 1
+	local length = #text
+	while index <= length do
+		local char = text:sub(index, index)
+		if char == "\\" then
+			index = index + 2
+		elseif char == separator then
+			return text:sub(1, index - 1), text:sub(index + 1)
+		else
+			index = index + 1
+		end
+	end
+	return nil
+end
+
+-- Детерминированное кодирование плоской таблицы: "key=n:123\nkey2=s:text".
+-- Порядок ключей фиксирован сортировкой, поэтому одинаковое состояние даёт
+-- одинаковую строку (NFR-CONS-3).
+function E.encode(payload)
+	if payload == nil then
+		return ""
+	end
+	if type(payload) ~= "table" then
+		return nil, "payload_not_table"
+	end
+
+	local parts = {}
+	for key, value in pairs(payload) do
+		local value_type = type(value)
+		local prefix = TYPE_PREFIX[value_type]
+		if prefix == nil then
+			return nil, "unsupported_value_type:" .. value_type
+		end
+		parts[#parts + 1] = escape(key) .. "=" .. prefix .. ":" .. escape(value)
+	end
+	table.sort(parts)
+	return table.concat(parts, "\n")
+end
+
+function E.decode(text)
+	if text == nil or text == "" then
+		return {}
+	end
+	if type(text) ~= "string" then
+		return nil, "payload_not_string"
+	end
+
+	local result = {}
+	for line in string.gmatch(text, "[^\n]+") do
+		local raw_key, raw_value = split_unescaped(line, "=")
+		if raw_key == nil or raw_value == nil then
+			return nil, "malformed_line:" .. line
+		end
+
+		local prefix = raw_value:sub(1, 1)
+		local rest = raw_value:sub(3)
+		if raw_value:sub(2, 2) ~= ":" then
+			return nil, "malformed_value:" .. raw_value
+		end
+
+		local key = unescape(raw_key)
+		if prefix == "n" then
+			local number = tonumber(unescape(rest))
+			if number == nil then
+				return nil, "malformed_number:" .. rest
+			end
+			result[key] = number
+		elseif prefix == "s" then
+			result[key] = unescape(rest)
+		elseif prefix == "b" then
+			result[key] = unescape(rest) == "true"
+		else
+			return nil, "unknown_type_prefix:" .. prefix
+		end
+	end
+	return result
+end
+
+function E.on(event_name, callback)
+	if type(event_name) ~= "string" or type(callback) ~= "function" then
+		return false
+	end
+
+	local list = subscribers[event_name]
+	if list == nil then
+		list = {}
+		subscribers[event_name] = list
+	end
+	for index = 1, #list do
+		if list[index] == callback then
+			return false
+		end
+	end
+	list[#list + 1] = callback
+	return true
+end
+
+function E.off(event_name, callback)
+	local list = subscribers[event_name]
+	if list == nil then
+		return false
+	end
+	for index = #list, 1, -1 do
+		if list[index] == callback then
+			table.remove(list, index)
+			return true
+		end
+	end
+	return false
+end
+
+-- Только локальная доставка (без сети). Используется входом из coop_sync.
+function E.dispatch(event_name, payload)
+	local list = subscribers[event_name]
+	if list == nil then
+		return 0
+	end
+
+	local delivered = 0
+	for index = 1, #list do
+		local ok, error_message = pcall(list[index], payload, event_name)
+		if not ok then
+			coop.log(string.format("event handler failed for %s: %s", tostring(event_name), tostring(error_message)))
+		else
+			delivered = delivered + 1
+		end
+	end
+	return delivered
+end
+
+-- Локальная доставка + исходящее событие для coop-ядра.
+function E.emit(event_name, payload)
+	if type(event_name) ~= "string" or event_name == "" then
+		return false, "invalid_event_name"
+	end
+	if emit_depth >= 8 then
+		coop.log("event emit recursion limit reached for " .. tostring(event_name))
+		return false, "recursion_limit"
+	end
+
+	payload = payload or {}
+
+	emit_depth = emit_depth + 1
+	local ok, error_message = pcall(E.dispatch, event_name, payload)
+	emit_depth = emit_depth - 1
+	if not ok then
+		return false, error_message
+	end
+
+	local bridge = coop.bridge()
+	if bridge == nil then
+		return true, 0
+	end
+
+	local encoded, encode_error = E.encode(payload)
+	if encoded == nil then
+		return false, encode_error
+	end
+
+	local sequence = bridge.emit_event(event_name, encoded)
+	if sequence == 0 then
+		return false, bridge.last_error()
+	end
+	return true, sequence
+end
+
+local function round(value, digits)
+	local factor = 10 ^ (digits or 3)
+	return math.floor(value * factor + 0.5) / factor
+end
+
+local function is_finite_number(value)
+	return type(value) == "number" and value == value and value ~= math.huge and value ~= -math.huge
+end
+
+function E.describe_object(object)
+	if object == nil then
+		return nil
+	end
+
+	local ok, description = pcall(function()
+		local position = object:position()
+		return {
+			id = object:id(),
+			section = object:section(),
+			x = round(position.x, 3),
+			y = round(position.y, 3),
+			z = round(position.z, 3),
+			level_vertex_id = object:level_vertex_id(),
+			game_vertex_id = object:game_vertex_id(),
+		}
+	end)
+
+	if ok and type(description) == "table" then
+		return description
+	end
+	return nil
+end
+
+local pulse = {
+	last_time = 0,
+	last_position = nil,
+	last_health = nil,
+	last_time_key = nil,
+	last_weather = nil,
+}
+
+local function reset_pulse()
+	pulse.last_time = 0
+	pulse.last_position = nil
+	pulse.last_health = nil
+	pulse.last_time_key = nil
+	pulse.last_weather = nil
+end
+
+local function actor()
+	if type(db) == "table" and db.actor ~= nil then
+		return db.actor
+	end
+	return nil
+end
+
+local function emit_move(current_actor)
+	local ok, position = pcall(function()
+		return current_actor:position()
+	end)
+	if not ok or position == nil then
+		return 0
+	end
+
+	local threshold = coop.config("move_threshold", coop.DEFAULT_MOVE_THRESHOLD)
+	local last = pulse.last_position
+	if last ~= nil then
+		local dx, dy, dz = position.x - last.x, position.y - last.y, position.z - last.z
+		if (dx * dx + dy * dy + dz * dz) < (threshold * threshold) then
+			return 0
+		end
+	end
+
+	pulse.last_position = { x = position.x, y = position.y, z = position.z }
+
+	local payload = {
+		x = round(position.x, 3),
+		y = round(position.y, 3),
+		z = round(position.z, 3),
+	}
+
+	local ok_ids, level_vertex_id = pcall(function()
+		return current_actor:level_vertex_id()
+	end)
+	if ok_ids and level_vertex_id ~= nil then
+		payload.level_vertex_id = level_vertex_id
+	end
+
+	local ok_game, game_vertex_id = pcall(function()
+		return current_actor:game_vertex_id()
+	end)
+	if ok_game and game_vertex_id ~= nil then
+		payload.game_vertex_id = game_vertex_id
+	end
+
+	E.emit(E.NAME.PLAYER_MOVE, payload)
+	return 1
+end
+
+local function emit_health(current_actor)
+	local ok, health = pcall(function()
+		return current_actor.health
+	end)
+	if not ok or not is_finite_number(health) then
+		return 0
+	end
+
+	local value = round(health, 2)
+	if pulse.last_health == value then
+		return 0
+	end
+
+	local previous = pulse.last_health
+	pulse.last_health = value
+
+	E.emit(E.NAME.PLAYER_HEALTH, {
+		health = value,
+		previous = previous or value,
+	})
+	return 1
+end
+
+local function emit_world_time()
+	if type(level) ~= "table" and type(level) ~= "userdata" then
+		return 0
+	end
+
+	local ok, days, hours, minutes = pcall(function()
+		return level.get_time_days(), level.get_time_hours(), level.get_time_minutes()
+	end)
+	if not ok or days == nil or hours == nil or minutes == nil then
+		return 0
+	end
+
+	local key = string.format("%d:%d:%d", days, hours, minutes)
+	if pulse.last_time_key == key then
+		return 0
+	end
+	pulse.last_time_key = key
+
+	E.emit(E.NAME.WORLD_TIME, {
+		days = days,
+		hours = hours,
+		minutes = minutes,
+	})
+	return 1
+end
+
+local function emit_weather()
+	if type(level) ~= "table" and type(level) ~= "userdata" then
+		return 0
+	end
+
+	local ok, weather = pcall(function()
+		return level.get_weather()
+	end)
+	if not ok or type(weather) ~= "string" then
+		return 0
+	end
+
+	if pulse.last_weather == weather then
+		return 0
+	end
+	pulse.last_weather = weather
+
+	E.emit(E.NAME.WEATHER, { weather = weather })
+	return 1
+end
+
+-- Один throttle-тик опроса. force=true — немедленно (спавн/тесты).
+function E.pulse(force)
+	local now = 0
+	if type(time_global) == "function" then
+		now = time_global()
+	end
+
+	local interval = coop.config("event_pulse_ms", coop.DEFAULT_EVENT_PULSE_MS)
+	if force ~= true and pulse.last_time ~= 0 and (now - pulse.last_time) < interval then
+		return 0
+	end
+	pulse.last_time = now
+
+	local current_actor = actor()
+	if current_actor == nil then
+		return 0
+	end
+
+	local emitted = 0
+	emitted = emitted + emit_move(current_actor)
+	emitted = emitted + emit_health(current_actor)
+	emitted = emitted + emit_world_time()
+	emitted = emitted + emit_weather()
+	return emitted
+end
+
+function E.reset()
+	subscribers = {}
+	reset_pulse()
+end
+
+-- --- обработчики движковых колбэков ---------------------------------------
+
+function E.on_actor_update(_binder, _delta)
+	E.pulse(false)
+end
+
+function E.on_actor_first_update(_binder)
+	reset_pulse()
+	E.emit(E.NAME.ACTOR_SPAWN, {})
+	E.pulse(true)
+end
+
+function E.on_actor_before_death(_hit, who)
+	local killer = E.describe_object(who)
+	local payload = {}
+	if killer ~= nil then
+		payload.killer_id = killer.id
+		payload.killer_section = killer.section
+	end
+	E.emit(E.NAME.PLAYER_DEATH, payload)
+end
+
+local function emit_inventory(action, item, extra)
+	local description = E.describe_object(item)
+	local payload = { action = action }
+	if description ~= nil then
+		payload.item_id = description.id
+		payload.section = description.section
+	end
+	if extra ~= nil then
+		for key, value in pairs(extra) do
+			payload[key] = value
+		end
+	end
+	E.emit(E.NAME.PLAYER_INVENTORY, payload)
+end
+
+function E.on_item_take(item)
+	local description = E.describe_object(item)
+	if description ~= nil then
+		E.emit(E.NAME.ITEM_PICKUP, description)
+	end
+	emit_inventory("take", item)
+end
+
+function E.on_item_drop(item)
+	emit_inventory("drop", item)
+end
+
+function E.on_item_use(item, section)
+	local extra = nil
+	if type(section) == "string" then
+		extra = { used_section = section }
+	end
+	emit_inventory("use", item, extra)
+end
+
+local function emit_spawn(event_name, object, server_object)
+	local payload = E.describe_object(object) or {}
+	local server_id = nil
+	if server_object ~= nil then
+		local ok, id = pcall(function()
+			return server_object.id
+		end)
+		if ok then
+			server_id = id
+		end
+	end
+	if server_id ~= nil then
+		payload.server_id = server_id
+	end
+	E.emit(event_name, payload)
+end
+
+local function emit_death(event_name, object, who)
+	local payload = E.describe_object(object) or {}
+	local killer = E.describe_object(who)
+	if killer ~= nil then
+		payload.killer_id = killer.id
+	end
+	E.emit(event_name, payload)
+end
+
+function E.on_npc_spawn(object, server_object)
+	emit_spawn(E.NAME.NPC_SPAWN, object, server_object)
+end
+
+function E.on_npc_death(object, who)
+	emit_death(E.NAME.NPC_DEATH, object, who)
+end
+
+function E.on_monster_spawn(object, server_object)
+	emit_spawn(E.NAME.NPC_SPAWN, object, server_object)
+end
+
+function E.on_monster_death(object, who)
+	emit_death(E.NAME.NPC_DEATH, object, who)
+end
+
+local registered = false
+
+local function register(event_name, callback)
+	if type(RegisterScriptCallback) == "function" then
+		RegisterScriptCallback(event_name, callback)
+	end
+end
+
+function E.on_game_start()
+	if registered then
+		return
+	end
+	registered = true
+
+	register("actor_on_update", E.on_actor_update)
+	register("actor_on_first_update", E.on_actor_first_update)
+	register("actor_on_before_death", E.on_actor_before_death)
+	register("actor_on_item_take", E.on_item_take)
+	register("actor_on_item_drop", E.on_item_drop)
+	register("actor_on_item_use", E.on_item_use)
+	register("npc_on_net_spawn", E.on_npc_spawn)
+	register("npc_on_death_callback", E.on_npc_death)
+	register("monster_on_net_spawn", E.on_monster_spawn)
+	register("monster_on_death_callback", E.on_monster_death)
+end
+
+-- Публичный фасад: coop.events.*
+if coop ~= nil then
+	coop.events = E
+end

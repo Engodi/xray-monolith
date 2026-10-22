@@ -1,0 +1,397 @@
+--[[
+	coop_parity.script — сверка экспортов хост<->клиент (F0-05).
+
+	Зачем: у хоста и клиента должна быть одинаковая поверхность coop-API
+	(C++ coop_bridge + Lua coop.*). Расхождение означает разные сборки/версии
+	скриптов и должно отклонять подключение (US-1.10, AC-1.10) до начала
+	обмена состоянием.
+
+	Формат манифеста (стабильный, без JSON):
+		layer\tname\targc\tsince
+	layer: "cpp" | "lua"; строки сортируются перед хешированием.
+
+	Отпечаток — FNV-1a 32 по нормализованному тексту (арифметика без bit-ops,
+	чтобы работать в Lua 5.1/LuaJIT движка).
+]]
+
+coop_parity = coop_parity or {}
+
+local P = coop_parity
+
+P.LAYER_CPP = "cpp"
+P.LAYER_LUA = "lua"
+P.VERSION = 1
+
+-- Канал handshake: менеджер соединений (F0-08) шлёт payload() хоста клиенту.
+P.CHANNEL = "coop.parity"
+
+local MOD32 = 4294967296
+local FNV_OFFSET = 2166136261
+local FNV_PRIME = 16777619
+
+local function log(message)
+	if coop ~= nil and type(coop.log) == "function" then
+		coop.log(message)
+	end
+end
+
+local function bridge()
+	if coop ~= nil and type(coop.bridge) == "function" then
+		return coop.bridge()
+	end
+	return nil
+end
+
+-- (a * b) mod 2^32 без потери точности double.
+local function mul32(a, b)
+	local a_high = math.floor(a / 65536)
+	local a_low = a % 65536
+	local b_high = math.floor(b / 65536)
+	local b_low = b % 65536
+	local middle = (a_high * b_low + a_low * b_high) % 65536
+	return (middle * 65536 + a_low * b_low) % MOD32
+end
+
+local function xor32(a, b)
+	local result = 0
+	local bit_value = 1
+	for _ = 1, 32 do
+		local a_bit = a % 2
+		local b_bit = b % 2
+		if a_bit ~= b_bit then
+			result = result + bit_value
+		end
+		a = (a - a_bit) / 2
+		b = (b - b_bit) / 2
+		bit_value = bit_value * 2
+	end
+	return result
+end
+
+local function normalized_line(entry)
+	return string.format("%s\t%s\t%d\t%d", entry.layer, entry.name, entry.argc, entry.since)
+end
+
+local function compare_entries(left, right)
+	if left.layer == right.layer then
+		return left.name < right.name
+	end
+	return left.layer < right.layer
+end
+
+local function normalize_entry(entry)
+	if type(entry) ~= "table" then
+		return nil, "entry_not_table"
+	end
+
+	local name = entry.name
+	if type(name) ~= "string" or name == "" then
+		return nil, "invalid_name"
+	end
+
+	local layer = entry.layer or P.LAYER_LUA
+	if layer ~= P.LAYER_CPP and layer ~= P.LAYER_LUA then
+		return nil, "invalid_layer"
+	end
+
+	local argc = tonumber(entry.argc or 0)
+	local since = tonumber(entry.since or 1)
+	if argc == nil or since == nil then
+		return nil, "invalid_arity"
+	end
+
+	return {
+		name = name,
+		argc = math.floor(argc),
+		since = math.floor(since),
+		layer = layer,
+	}
+end
+
+local function normalize_manifest(manifest)
+	if type(manifest) ~= "table" then
+		return nil, "manifest_not_table"
+	end
+
+	local result = {}
+	for index = 1, #manifest do
+		local entry, reason = normalize_entry(manifest[index])
+		if entry == nil then
+			return nil, string.format("entry_%d:%s", index, tostring(reason))
+		end
+		result[#result + 1] = entry
+	end
+	table.sort(result, compare_entries)
+	return result
+end
+
+function P.fingerprint(manifest)
+	local normalized, reason = normalize_manifest(manifest)
+	if normalized == nil then
+		return nil, reason
+	end
+
+	local lines = {}
+	for index = 1, #normalized do
+		lines[index] = normalized_line(normalized[index])
+	end
+	local text = table.concat(lines, "\n")
+
+	local hash = FNV_OFFSET
+	for index = 1, #text do
+		hash = xor32(hash, text:byte(index))
+		hash = mul32(hash, FNV_PRIME)
+	end
+
+	return string.format("%08x", hash)
+end
+
+function P.local_manifest()
+	local result = {}
+
+	local adapter = bridge()
+	if adapter ~= nil then
+		local ok, entries = pcall(function()
+			return adapter.api_manifest()
+		end)
+		if ok and type(entries) == "table" then
+			for index = 1, #entries do
+				local entry = entries[index]
+				result[#result + 1] = {
+					name = entry.name,
+					argc = entry.argc,
+					since = entry.since,
+					layer = P.LAYER_CPP,
+				}
+			end
+		end
+	end
+
+	if coop ~= nil and type(coop.api) == "table" then
+		for index = 1, #coop.api do
+			local entry = coop.api[index]
+			result[#result + 1] = {
+				name = entry.name,
+				argc = entry.argc,
+				since = entry.since,
+				layer = P.LAYER_LUA,
+			}
+		end
+	end
+
+	table.sort(result, compare_entries)
+	return result
+end
+
+function P.local_fingerprint()
+	return P.fingerprint(P.local_manifest())
+end
+
+-- Готовый к отправке манифест локальной стороны (handshake).
+function P.payload()
+	return P.serialize(P.local_manifest())
+end
+
+function P.serialize(manifest)
+	local normalized, reason = normalize_manifest(manifest)
+	if normalized == nil then
+		return nil, reason
+	end
+
+	local lines = {}
+	for index = 1, #normalized do
+		lines[index] = normalized_line(normalized[index])
+	end
+	return table.concat(lines, "\n"), P.fingerprint(normalized)
+end
+
+function P.parse(text)
+	if type(text) ~= "string" then
+		return nil, "payload_not_string"
+	end
+	if text == "" then
+		return {}
+	end
+
+	local result = {}
+	for line in string.gmatch(text, "[^\n]+") do
+		local layer, name, argc, since = string.match(line, "^(%a+)\t([^\t]+)\t(%d+)\t(%d+)$")
+		if layer == nil then
+			return nil, "malformed_line:" .. line
+		end
+		result[#result + 1] = {
+			layer = layer,
+			name = name,
+			argc = tonumber(argc),
+			since = tonumber(since),
+		}
+	end
+	return normalize_manifest(result)
+end
+
+local function index_manifest(manifest)
+	local map = {}
+	for index = 1, #manifest do
+		local entry = manifest[index]
+		map[entry.layer .. ":" .. entry.name] = entry
+	end
+	return map
+end
+
+-- Возвращает таблицу результата:
+-- { ok, reason, local_fp, remote_fp, local_count, remote_count, missing, extra, mismatched }
+function P.verify(remote_manifest)
+	local local_manifest = P.local_manifest()
+	local local_fingerprint = P.fingerprint(local_manifest)
+
+	local remote = remote_manifest
+	if type(remote) == "string" then
+		local parsed, parse_error = P.parse(remote)
+		if parsed == nil then
+			return {
+				ok = false,
+				reason = "remote_parse_failed:" .. tostring(parse_error),
+				local_fp = local_fingerprint,
+				local_count = #local_manifest,
+			}
+		end
+		remote = parsed
+	end
+
+	local normalized_remote, normalize_error = normalize_manifest(remote)
+	if normalized_remote == nil then
+		return {
+			ok = false,
+			reason = "remote_invalid:" .. tostring(normalize_error),
+			local_fp = local_fingerprint,
+			local_count = #local_manifest,
+		}
+	end
+
+	local local_map = index_manifest(local_manifest)
+	local remote_map = index_manifest(normalized_remote)
+
+	local missing = {}
+	local extra = {}
+	local mismatched = {}
+
+	for key, entry in pairs(local_map) do
+		local counterpart = remote_map[key]
+		if counterpart == nil then
+			missing[#missing + 1] = key
+		elseif counterpart.argc ~= entry.argc or counterpart.since ~= entry.since then
+			mismatched[#mismatched + 1] = string.format(
+				"%s (argc %d->%d, since %d->%d)",
+				key,
+				entry.argc,
+				counterpart.argc,
+				entry.since,
+				counterpart.since
+			)
+		end
+	end
+
+	for key in pairs(remote_map) do
+		if local_map[key] == nil then
+			extra[#extra + 1] = key
+		end
+	end
+
+	table.sort(missing)
+	table.sort(extra)
+	table.sort(mismatched)
+
+	local ok = #missing == 0 and #extra == 0 and #mismatched == 0
+
+	return {
+		ok = ok,
+		reason = ok and "match" or "mismatch",
+		local_fp = local_fingerprint,
+		remote_fp = P.fingerprint(normalized_remote),
+		local_count = #local_manifest,
+		remote_count = #normalized_remote,
+		missing = missing,
+		extra = extra,
+		mismatched = mismatched,
+	}
+end
+
+function P.describe(result)
+	if type(result) ~= "table" then
+		return "parity: no result"
+	end
+	if result.ok then
+		return string.format("parity: match (%d exports, %s)", result.local_count or 0, tostring(result.local_fp))
+	end
+
+	local parts = {
+		string.format("parity: mismatch (local %s / remote %s)", tostring(result.local_fp), tostring(result.remote_fp)),
+	}
+	if result.reason ~= nil and result.reason ~= "mismatch" then
+		parts[#parts + 1] = "reason: " .. tostring(result.reason)
+	end
+	for _, key in ipairs(result.missing or {}) do
+		parts[#parts + 1] = "missing on remote: " .. tostring(key)
+	end
+	for _, key in ipairs(result.extra or {}) do
+		parts[#parts + 1] = "extra on remote: " .. tostring(key)
+	end
+	for _, entry in ipairs(result.mismatched or {}) do
+		parts[#parts + 1] = "arity/version mismatch: " .. tostring(entry)
+	end
+	return table.concat(parts, "\n")
+end
+
+-- Вызывается менеджером соединений (F0-08) на handshake с манифестом хоста.
+function P.handshake(remote_payload)
+	local result = P.verify(remote_payload)
+	if not result.ok then
+		log(P.describe(result))
+	end
+	return result.ok, result
+end
+
+-- Проверка, что реестр coop.api не разошёлся с фактическими функциями.
+function P.validate_local()
+	local problems = {}
+	if coop == nil or type(coop.api) ~= "table" then
+		return false, { "coop.api registry is missing" }
+	end
+
+	local seen = {}
+	for index = 1, #coop.api do
+		local entry = coop.api[index]
+		local key = tostring(entry.name)
+		if seen[key] then
+			problems[#problems + 1] = "duplicate registry entry: " .. key
+		end
+		seen[key] = true
+
+		local target = coop
+		local resolved = true
+		for part in string.gmatch(key, "[^%.]+") do
+			if type(target) ~= "table" or target[part] == nil then
+				resolved = false
+				break
+			end
+			target = target[part]
+		end
+		if not resolved or type(target) ~= "function" then
+			problems[#problems + 1] = "registry entry has no function: " .. key
+		end
+	end
+
+	return #problems == 0, problems
+end
+
+function P.on_game_start()
+	local ok, problems = P.validate_local()
+	if not ok then
+		log("local API registry is inconsistent: " .. table.concat(problems, "; "))
+	end
+end
+
+-- Публичный фасад: coop.parity.*
+if coop ~= nil then
+	coop.parity = P
+end
