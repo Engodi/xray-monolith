@@ -20,6 +20,7 @@ local modules = {
 	"test_sync",
 	"test_parity",
 	"test_debug",
+	"test_core",
 }
 
 for _, module_name in ipairs(modules) do

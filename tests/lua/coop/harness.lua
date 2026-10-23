@@ -20,6 +20,7 @@ H.script_order = {
 	"coop_events.script",
 	"coop_parity.script",
 	"coop_sync.script",
+	"coop_core.script",
 }
 
 local suite_name = "?"
@@ -448,6 +449,8 @@ function H.setup(options)
 	coop_debug = nil
 	coop_parity = nil
 	coop_bridge = nil
+	coop_core = nil
+	coop_runtime = nil
 
 	H.logs = {}
 	H.callbacks = {}

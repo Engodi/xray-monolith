@@ -5178,6 +5178,18 @@
     <ClInclude Include="coop\coop_bridge_script.h">
       <Filter>Coop</Filter>
     </ClInclude>
+    <ClInclude Include="coop\coop_bot_channel.h">
+      <Filter>Coop</Filter>
+    </ClInclude>
+    <ClInclude Include="coop\coop_bot_json.h">
+      <Filter>Coop</Filter>
+    </ClInclude>
+    <ClInclude Include="coop\coop_core_runtime.h">
+      <Filter>Coop</Filter>
+    </ClInclude>
+    <ClInclude Include="coop\coop_core_script.h">
+      <Filter>Coop</Filter>
+    </ClInclude>
     <ClInclude Include="base_client_classes.h">
       <Filter>AI\AScript\ScriptClasses\BaseClientClasses</Filter>
     </ClInclude>
@@ -8811,6 +8823,18 @@
       <Filter>Coop</Filter>
     </ClCompile>
     <ClCompile Include="coop\coop_bridge_script.cpp">
+      <Filter>Coop</Filter>
+    </ClCompile>
+    <ClCompile Include="coop\coop_bot_channel.cpp">
+      <Filter>Coop</Filter>
+    </ClCompile>
+    <ClCompile Include="coop\coop_bot_json.cpp">
+      <Filter>Coop</Filter>
+    </ClCompile>
+    <ClCompile Include="coop\coop_core_runtime.cpp">
+      <Filter>Coop</Filter>
+    </ClCompile>
+    <ClCompile Include="coop\coop_core_script.cpp">
       <Filter>Coop</Filter>
     </ClCompile>
     <ClCompile Include="base_client_classes_script.cpp">

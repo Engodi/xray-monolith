@@ -20,6 +20,7 @@ luajit tests/lua/coop/e2e_loopback.lua  # сквозной прогон хост
 | `test_sync.lua` | single-writer, отказ клиенту, request/response, таймаут |
 | `test_parity.lua` | манифест/отпечаток, missing/extra/arity, сериализация |
 | `test_debug.lua` | гейтинг debug-поверхности и debug-команды |
+| `test_core.lua` | проводка ядра: разбор payload, события среды → `coop.events`, сырой канал `coop.sync.on_raw`, offline-режим |
 | `e2e_loopback.lua` | реальные скрипты: хост пишет состояние/событие, клиент применяет |
 
 Форматирование скриптов — stylua с конфигом CI

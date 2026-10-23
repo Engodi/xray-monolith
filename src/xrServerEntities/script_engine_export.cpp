@@ -24,6 +24,7 @@
 #include "ui/UIPdaWnd.h"
 #ifndef XRSE_FACTORY_EXPORTS
 #	include "coop/coop_bridge_script.h"
+#	include "coop/coop_core_script.h"
 #endif
 
 void export_classes	(lua_State *L)
@@ -35,6 +36,9 @@ void export_classes	(lua_State *L)
 
 	// F0-05: coop Lua bridge (engine <-> Lua adapter, game build only).
 	coop_bridge_registrator::script_register(L);
+
+	// F0-04/F0-07: coop core runtime (session tick, event log, bot channel).
+	coop_core_registrator::script_register(L);
 
 	CScriptNetPacket::script_register(L);
 	CScriptFcolor::script_register(L);

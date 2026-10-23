@@ -1,4 +1,4 @@
-<?xml version="1.0" encoding="utf-8"?>
+﻿<?xml version="1.0" encoding="utf-8"?>
 <Project DefaultTargets="Build" ToolsVersion="14.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
   <ItemGroup Label="ProjectConfigurations">
     <ProjectConfiguration Include="ProfiledDX11|x64">
@@ -1008,6 +1008,10 @@
     <ClInclude Include="shader_bus_script.h" />
     <ClInclude Include="coop\coop_bridge.h" />
     <ClInclude Include="coop\coop_bridge_script.h" />
+    <ClInclude Include="coop\coop_bot_channel.h" />
+    <ClInclude Include="coop\coop_bot_json.h" />
+    <ClInclude Include="coop\coop_core_runtime.h" />
+    <ClInclude Include="coop\coop_core_script.h" />
     <ClInclude Include="controller_state_panic_inline.h" />
     <ClInclude Include="control_action.h" />
     <ClInclude Include="control_action_inline.h" />
@@ -2720,6 +2724,20 @@
       <PrecompiledHeaderFile>pch_script.h</PrecompiledHeaderFile>
       <PrecompiledHeaderOutputFile>$(IntDir)$(ProjectName)_script.pch</PrecompiledHeaderOutputFile>
     </ClCompile>
+    <ClCompile Include="coop\coop_bot_json.cpp">
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="coop\coop_bot_channel.cpp">
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="coop\coop_core_runtime.cpp">
+      <PrecompiledHeaderFile>pch_script.h</PrecompiledHeaderFile>
+      <PrecompiledHeaderOutputFile>$(IntDir)$(ProjectName)_script.pch</PrecompiledHeaderOutputFile>
+    </ClCompile>
+    <ClCompile Include="coop\coop_core_script.cpp">
+      <PrecompiledHeaderFile>pch_script.h</PrecompiledHeaderFile>
+      <PrecompiledHeaderOutputFile>$(IntDir)$(ProjectName)_script.pch</PrecompiledHeaderOutputFile>
+    </ClCompile>
     <ClCompile Include="cover_evaluators.cpp" />
     <ClCompile Include="cover_manager.cpp" />
     <ClCompile Include="cover_point_script.cpp">
@@ -4411,6 +4429,41 @@
     <ProjectReference Include="$(SolutionDir)xrCore\xrCore.vcxproj">
       <Project>{a0f7d1fb-59a7-4717-a7e4-96f37e91998e}</Project>
     </ProjectReference>
+  </ItemGroup>
+  <!-- =====================================================================
+       F0-04/F0-05/F0-06/F0-07: coop core sources (coop repository, `src/core`
+       + the two libraries it builds on). The engine tree and the coop checkout
+       are siblings in CI (`engine/`, `coop/`), so the default root is
+       `$(SolutionDir)..\..\coop` (= <workspace>/coop). Other layouts override
+       it: msbuild /p:CoopSourceRoot=D:\src\xray-net
+
+       The core stays a separate, engine-free library (NFR-ARCH-9): it is only
+       compiled into this project, never modified here. `transport_link.cpp` is
+       excluded until the F0-02 transport is wired into the engine — it is the
+       single file that binds to the transport C ABI.
+       ===================================================================== -->
+  <PropertyGroup>
+    <CoopSourceRoot Condition="'$(CoopSourceRoot)' == ''">$(SolutionDir)..\..\coop</CoopSourceRoot>
+    <CoopCoreIncludeDirs>$(CoopSourceRoot)\src\core\include;$(CoopSourceRoot)\src\replication\include;$(CoopSourceRoot)\src\cfgdiff\include;$(CoopSourceRoot)\src\transport\include</CoopCoreIncludeDirs>
+  </PropertyGroup>
+  <ItemDefinitionGroup>
+    <ClCompile>
+      <AdditionalIncludeDirectories>$(CoopCoreIncludeDirs);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+    </ClCompile>
+  </ItemDefinitionGroup>
+  <ItemGroup Label="CoopCore">
+    <ClCompile Include="$(CoopSourceRoot)\src\core\src\*.cpp" Exclude="$(CoopSourceRoot)\src\core\src\transport_link.cpp">
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+      <ObjectFileName>$(IntDir)coop_core\%(Filename).obj</ObjectFileName>
+    </ClCompile>
+    <ClCompile Include="$(CoopSourceRoot)\src\replication\src\*.cpp">
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+      <ObjectFileName>$(IntDir)coop_replication\%(Filename).obj</ObjectFileName>
+    </ClCompile>
+    <ClCompile Include="$(CoopSourceRoot)\src\cfgdiff\src\*.cpp" Exclude="$(CoopSourceRoot)\src\cfgdiff\src\transport_link.cpp">
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+      <ObjectFileName>$(IntDir)coop_cfgdiff\%(Filename).obj</ObjectFileName>
+    </ClCompile>
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">

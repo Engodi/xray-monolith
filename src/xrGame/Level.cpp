@@ -38,6 +38,7 @@
 #include "trade_parameters.h"
 #include "game_cl_base_weapon_usage_statistic.h"
 #include "MainMenu.h"
+#include "coop/coop_core_runtime.h"
 #include "xrEngine/XR_IOConsole.h"
 #include "actor.h"
 #include "player_hud.h"
@@ -286,6 +287,10 @@ extern CAI_Space* g_ai_space;
 
 CLevel::~CLevel()
 {
+	// F0-07: the coop core runtime flushes the run artifacts (event log,
+	// metrics, bot observations) when the level goes away.
+	coop::core_runtime().shutdown();
+
 	//crash_saving::save_impl = nullptr; // CLevel not available, disable crash save
 	xr_delete(g_player_hud);
 	delete_data(m_script_attachments);
@@ -976,6 +981,11 @@ void CLevel::MakeReconnect()
 void CLevel::OnFrame()
 {
 	PROF_EVENT("CLevel::OnFrame()");
+
+	// F0-04/F0-07/F0-12: tick of the host-authoritative coop core in the game
+	// loop (headless host/client). No-op unless the F0-11 harness armed the
+	// profile, so the normal game path pays one flag test per frame.
+	coop::core_runtime().tick();
 
 #ifdef DEBUG_MEMORY_MANAGER
     debug_memory_guard __guard__;

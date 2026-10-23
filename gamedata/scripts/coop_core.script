@@ -1,0 +1,270 @@
+--[[
+	coop_core.script — точка входа движковой проводки coop-ядра
+	(F0-04 headless, F0-05 мост, F0-07 наблюдаемость, F0-12 боты).
+
+	Что делает слой:
+	  * запускает Lua-половину coop-моста (coop.on_game_start,
+	    coop_events.on_game_start) ровно один раз;
+	  * подписывается на канал ядра `environment` и переводит события мира
+	    (погода, выброс, скачок часов) в общий поток `coop.events`, чтобы
+	    мод-слой видел те же события, что попадают в артефакт F0-07;
+	  * отдаёт тонкий фасад над движковой таблицей `coop_runtime` (C++):
+	    статус проводки, запуск, debug-команды. Если таблицы нет (vanilla-
+	    сборка), слой работает в offline-режиме и не падает.
+
+	Границы: ядро живёт в C++ и тикает из игрового цикла; здесь только события
+	и команды (NFR-ARCH-10 — никакого покадрового маршаллинга).
+]]
+
+coop_core = coop_core or {}
+
+local C = coop_core
+
+C.VERSION = 1
+
+-- Канал ядра, на котором приходят события среды (`xrn::core::env::kBridgeChannel`).
+C.CHANNEL_ENVIRONMENT = "environment"
+
+-- Имена событий мира в общем потоке: совпадают с тем, что наблюдают боты
+-- (`observations.jsonl`), поэтому Lua-мод и e2e видят одно и то же.
+C.EVENT = {
+	WEATHER = "weather",
+	EMISSION_START = "emission_start",
+	EMISSION_END = "emission_end",
+	TIME_SYNC = "time_sync",
+}
+
+local function log(message)
+	if coop ~= nil and type(coop.log) == "function" then
+		coop.log(message)
+	elseif type(printf) == "function" then
+		printf("[coop_core] " .. tostring(message))
+	end
+end
+
+local function runtime()
+	if type(coop_runtime) == "table" then
+		return coop_runtime
+	end
+	return nil
+end
+
+-- --- фасад над движковой проводкой ----------------------------------------
+
+function C.available()
+	local adapter = runtime()
+	return adapter ~= nil and adapter.available() == true
+end
+
+function C.start()
+	local adapter = runtime()
+	if adapter == nil then
+		return false, "runtime_unavailable"
+	end
+	local started = adapter.start()
+	if started ~= true then
+		return false, "runtime_not_started"
+	end
+	return true
+end
+
+function C.status()
+	local adapter = runtime()
+	if adapter == nil then
+		return { available = false, active = false, role = "offline" }
+	end
+	local status = adapter.status()
+	if type(status) ~= "table" then
+		return { available = false, active = false, role = "offline" }
+	end
+	status.available = true
+	return status
+end
+
+-- Debug-поверхность (PLAN §8.11): команда бота -> ядро. Возвращает
+-- { ok = bool, detail = string }.
+function C.command(name, argument)
+	local adapter = runtime()
+	if adapter == nil then
+		return { ok = false, detail = "runtime_unavailable" }
+	end
+	if type(name) ~= "string" or name == "" then
+		return { ok = false, detail = "empty_command" }
+	end
+	local result = adapter.command(name, tostring(argument or ""))
+	if type(result) ~= "table" then
+		return { ok = false, detail = "invalid_answer" }
+	end
+	return result
+end
+
+-- --- разбор канонического payload ядра -------------------------------------
+-- Формат: `key=value;key=value`, служебные символы (`%;=|:`) экранированы как
+-- `%XX`. Тот же формат, что `xrn::core::detail` (bridge_text.hpp).
+
+local function unescape(text)
+	local out = {}
+	local index = 1
+	local length = #text
+	while index <= length do
+		local char = text:sub(index, index)
+		if char == "%" and index + 2 <= length then
+			local hex = text:sub(index + 1, index + 2)
+			local code = tonumber(hex, 16)
+			if code ~= nil then
+				out[#out + 1] = string.char(code)
+				index = index + 3
+			else
+				out[#out + 1] = char
+				index = index + 1
+			end
+		else
+			out[#out + 1] = char
+			index = index + 1
+		end
+	end
+	return table.concat(out)
+end
+
+function C.parse(payload)
+	if type(payload) ~= "string" or payload == "" then
+		return nil
+	end
+	local values = {}
+	for pair in payload:gmatch("[^;]+") do
+		local separator = pair:find("=", 1, true)
+		if separator == nil then
+			return nil
+		end
+		local key = unescape(pair:sub(1, separator - 1))
+		if key == "" then
+			return nil
+		end
+		values[key] = unescape(pair:sub(separator + 1))
+	end
+	return values
+end
+
+local function dispatch(event_name, payload)
+	if coop_events ~= nil and type(coop_events.dispatch) == "function" then
+		coop_events.dispatch(event_name, payload)
+	end
+end
+
+local function as_number(text)
+	if type(text) ~= "string" then
+		return nil
+	end
+	return tonumber(text)
+end
+
+-- Одно событие среды -> поток `coop.events`.
+function C.on_event(values)
+	if type(values) ~= "table" then
+		return false
+	end
+
+	local kind = values.event
+	if kind == "weather" then
+		dispatch(C.EVENT.WEATHER, {
+			at = as_number(values.at),
+			next_at = as_number(values.next),
+			weather_type = values.type,
+			phase = values.phase,
+			intensity = as_number(values.intensity),
+			step = as_number(values.step),
+		})
+		return true
+	end
+	if kind == "emission" then
+		local payload = {
+			transition = values.transition,
+			phase = values.phase,
+			cycle = as_number(values.cycle),
+			at = as_number(values.at),
+			ends_at = as_number(values["end"]),
+		}
+		if values.transition == "warn" or values.transition == "start" then
+			dispatch(C.EVENT.EMISSION_START, payload)
+			return true
+		end
+		if values.transition == "end" then
+			dispatch(C.EVENT.EMISSION_END, payload)
+			return true
+		end
+		return false  -- peak: граница есть в состоянии, отдельного события нет
+	end
+	if kind == "clock" then
+		dispatch(C.EVENT.TIME_SYNC, {
+			world_ms = as_number(values.at),
+			day = as_number(values.day),
+			hour = as_number(values.hour),
+			minute = as_number(values.minute),
+			second = as_number(values.second),
+		})
+		return true
+	end
+	return false
+end
+
+-- Сырой обработчик канала ядра (подписка coop.sync.on_raw).
+function C.on_environment(payload)
+	local values = C.parse(payload)
+	if values == nil then
+		log("malformed environment payload: " .. tostring(payload))
+		return false
+	end
+	return C.on_event(values)
+end
+
+-- --- запуск ----------------------------------------------------------------
+
+local started = false
+local subscribed = false
+
+function C.on_game_start()
+	if started then
+		return true
+	end
+	started = true
+
+	if coop ~= nil and type(coop.on_game_start) == "function" then
+		coop.on_game_start()
+	end
+	if coop_events ~= nil and type(coop_events.on_game_start) == "function" then
+		coop_events.on_game_start()
+	end
+	if coop ~= nil and type(coop.sync) == "table" and type(coop.sync.on_raw) == "function" then
+		subscribed = coop.sync.on_raw(C.CHANNEL_ENVIRONMENT, C.on_environment) == true
+	end
+
+	local adapter = runtime()
+	if adapter ~= nil and adapter.available() ~= true then
+		adapter.start()
+	end
+
+	local status = C.status()
+	log(
+		string.format(
+			"wired: role=%s instance=%s events=%s log=%s",
+			tostring(status.role),
+			tostring(status.instance),
+			tostring(status.events),
+			tostring(status.log_path)
+		)
+	)
+	return true
+end
+
+function C.describe()
+	local status = C.status()
+	return {
+		version = C.VERSION,
+		started = started,
+		subscribed = subscribed,
+		available = status.available == true,
+		role = status.role,
+		instance = status.instance,
+		log_path = status.log_path,
+	}
+end

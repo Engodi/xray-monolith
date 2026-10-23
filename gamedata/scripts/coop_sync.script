@@ -72,6 +72,10 @@ S.CHANNEL_RESPONSE = "coop.response"
 
 local channels = {}
 local subscribers = {}
+-- Сырые подписчики канала: получают payload как есть, без декодера
+-- `key=n:value`. Нужны каналам ядра (`environment`, F0-05/F0-07), у которых
+-- собственный канонический формат `key=value;...`.
+local raw_subscribers = {}
 local state_cache = {}
 local pending = {}
 local next_request_id = 0
@@ -199,6 +203,60 @@ function S.on(channel, callback)
 		return false, "invalid_callback"
 	end
 	return subscribe(channel, callback)
+end
+
+-- Подписка на сырой payload канала (без разбора кодеком coop_events).
+function S.on_raw(channel, callback)
+	if type(channel) ~= "string" or channel == "" then
+		return false, "invalid_channel"
+	end
+	if type(callback) ~= "function" then
+		return false, "invalid_callback"
+	end
+	local list = raw_subscribers[channel]
+	if list == nil then
+		list = {}
+		raw_subscribers[channel] = list
+	end
+	for index = 1, #list do
+		if list[index] == callback then
+			return false, "already_subscribed"
+		end
+	end
+	list[#list + 1] = callback
+	return true
+end
+
+function S.off_raw(channel, callback)
+	local list = raw_subscribers[channel]
+	if list == nil then
+		return false, "not_subscribed"
+	end
+	for index = #list, 1, -1 do
+		if list[index] == callback then
+			table.remove(list, index)
+			return true
+		end
+	end
+	return false, "not_subscribed"
+end
+
+local function dispatch_raw(channel, payload)
+	local list = raw_subscribers[channel]
+	if list == nil then
+		return 0
+	end
+
+	local delivered = 0
+	for index = 1, #list do
+		local ok, error_message = pcall(list[index], payload, channel)
+		if ok then
+			delivered = delivered + 1
+		else
+			log(string.format("raw handler failed for %s: %s", tostring(channel), tostring(error_message)))
+		end
+	end
+	return delivered
 end
 
 function S.off(channel, callback)
@@ -500,6 +558,14 @@ function S.on_inbound(channel, payload, sequence)
 	end
 
 	stats.received = stats.received + 1
+
+	-- Каналы ядра (F0-05/F0-07): у них свой формат payload, поэтому они идут
+	-- мимо кодека coop_events к сырым подписчикам. Канал без активных сырых
+	-- подписчиков обрабатывается как обычно.
+	local raw = raw_subscribers[channel]
+	if raw ~= nil and #raw > 0 then
+		return dispatch_raw(channel, payload) > 0
+	end
 
 	if channel == S.CHANNEL_STATE then
 		return handle_state(payload)
