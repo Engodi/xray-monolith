@@ -1012,6 +1012,7 @@
     <ClInclude Include="coop\coop_bot_json.h" />
     <ClInclude Include="coop\coop_core_runtime.h" />
     <ClInclude Include="coop\coop_core_script.h" />
+    <ClInclude Include="coop\coop_transport.h" />
     <ClInclude Include="controller_state_panic_inline.h" />
     <ClInclude Include="control_action.h" />
     <ClInclude Include="control_action_inline.h" />
@@ -2733,10 +2734,16 @@
     <ClCompile Include="coop\coop_core_runtime.cpp">
       <PrecompiledHeaderFile>pch_script.h</PrecompiledHeaderFile>
       <PrecompiledHeaderOutputFile>$(IntDir)$(ProjectName)_script.pch</PrecompiledHeaderOutputFile>
+      <PreprocessorDefinitions>XNT_STATIC=1;%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </ClCompile>
     <ClCompile Include="coop\coop_core_script.cpp">
       <PrecompiledHeaderFile>pch_script.h</PrecompiledHeaderFile>
       <PrecompiledHeaderOutputFile>$(IntDir)$(ProjectName)_script.pch</PrecompiledHeaderOutputFile>
+    </ClCompile>
+    <!-- F0-02: the transport adapter is engine-free (no pch), like the bot protocol. -->
+    <ClCompile Include="coop\coop_transport.cpp">
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+      <PreprocessorDefinitions>XNT_STATIC=1;%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </ClCompile>
     <ClCompile Include="cover_evaluators.cpp" />
     <ClCompile Include="cover_manager.cpp" />
@@ -4431,16 +4438,22 @@
     </ProjectReference>
   </ItemGroup>
   <!-- =====================================================================
-       F0-04/F0-05/F0-06/F0-07: coop core sources (coop repository, `src/core`
-       + the two libraries it builds on). The engine tree and the coop checkout
-       are siblings in CI (`engine/`, `coop/`), so the default root is
-       `$(SolutionDir)..\..\coop` (= <workspace>/coop). Other layouts override
-       it: msbuild /p:CoopSourceRoot=D:\src\xray-net
+       F0-02/F0-04/F0-05/F0-06/F0-07: coop sources (coop repository, `src/core`,
+       `src/transport` + the two libraries the core builds on). The engine tree
+       and the coop checkout are siblings in CI (`engine/`, `coop/`), so the
+       default root is `$(SolutionDir)..\..\coop` (= <workspace>/coop). Other
+       layouts override it: msbuild /p:CoopSourceRoot=D:\src\xray-net
 
        The core stays a separate, engine-free library (NFR-ARCH-9): it is only
-       compiled into this project, never modified here. `transport_link.cpp` is
-       excluded until the F0-02 transport is wired into the engine — it is the
-       single file that binds to the transport C ABI.
+       compiled into this project, never modified here.
+
+       F0-02: `transport_link.cpp` (the single file that binds to the transport
+       C ABI) and the transport's own sources are compiled in too. The transport
+       is linked statically (`XNT_STATIC`), so a headless run needs no extra DLL
+       next to the exe. The GameNetworkingSockets backend stays the transport's
+       own seam (`XNET_WITH_GNS`, not enabled here: the built-in UDP backend
+       carries the reliability layer), so no GNS/protobuf/OpenSSL is linked by
+       this project.
        ===================================================================== -->
   <PropertyGroup>
     <CoopSourceRoot Condition="'$(CoopSourceRoot)' == ''">$(SolutionDir)..\..\coop</CoopSourceRoot>
@@ -4450,11 +4463,26 @@
     <ClCompile>
       <AdditionalIncludeDirectories>$(CoopCoreIncludeDirs);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
     </ClCompile>
+    <Link>
+      <!-- F0-02: the transport's UDP channel is Winsock (WSAStartup/sendto/...).
+           The engine itself never linked ws2_32, so the coop transport brings it. -->
+      <AdditionalDependencies>ws2_32.lib;%(AdditionalDependencies)</AdditionalDependencies>
+    </Link>
   </ItemDefinitionGroup>
   <ItemGroup Label="CoopCore">
-    <ClCompile Include="$(CoopSourceRoot)\src\core\src\*.cpp" Exclude="$(CoopSourceRoot)\src\core\src\transport_link.cpp">
+    <ClCompile Include="$(CoopSourceRoot)\src\core\src\*.cpp">
       <PrecompiledHeader>NotUsing</PrecompiledHeader>
       <ObjectFileName>$(IntDir)coop_core\%(Filename).obj</ObjectFileName>
+      <PreprocessorDefinitions>XNT_STATIC=1;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
+    <ClCompile Include="$(CoopSourceRoot)\src\transport\src\*.cpp">
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+      <ObjectFileName>$(IntDir)coop_transport\%(Filename).obj</ObjectFileName>
+      <PreprocessorDefinitions>XNT_STATIC=1;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <!-- The transport's private headers stay scoped to its own sources: the
+           project-wide include path must not shadow engine headers ("common.h",
+           "session.h", "wire.h", ...). -->
+      <AdditionalIncludeDirectories>$(CoopSourceRoot)\src\transport\src;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
     </ClCompile>
     <ClCompile Include="$(CoopSourceRoot)\src\replication\src\*.cpp">
       <PrecompiledHeader>NotUsing</PrecompiledHeader>

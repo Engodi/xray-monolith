@@ -21,6 +21,7 @@ CLevel::OnFrame
 
 | Требование | Где | Как проверено |
 |---|---|---|
+| Транспорт F0-02 (кросс-процессный UDP) | `coop/coop_transport.*` → `xrn::core::HostTransportLink` / `ClientTransportLink`; `transport_link.cpp` собран в xrGame | `tests/cpp/coop/run_core.sh` (host + client в разных процессах по UDP loopback) |
 | Тик ядра в игровом цикле | `CLevel::OnFrame` → `core_runtime().tick()`; фиксированный шаг 20 мс, ограничение догона 200 мс | `tests/cpp/coop/run_core.sh` (шаги/тик растут) |
 | Публикация событий мира в Lua | `env::publish_environment_events` → `HostSession::bridge()` → `coop::bridge().pump()` → `coop.sync.on_inbound` | `tests/lua/coop/test_core.lua` (сырой канал `environment` → `coop.events`) |
 | События мира в наблюдения ботов | `coop_bot_channel` из `ccop_core_runtime` (`weather`, `emission_start`, `time_sync`, `player_rejoin`, `window_expired`, `join_rejected`) | `tests/cpp/coop/run_core.sh` |
@@ -40,6 +41,12 @@ CLevel::OnFrame
 | `XRN_HARNESS_ROLE` | `host` / `client` |
 | `XRN_HARNESS_SLOT` | слот клиента (идентичность игрока) |
 | `XRN_HARNESS_LEVEL` | имя уровня для наблюдений (по умолчанию `l01_escape`) |
+| `XRN_HARNESS_NET` | `udp` (по умолчанию) — реальный транспорт; `inprocess` — очереди в одном процессе (только локальные проверки) |
+| `XRN_HARNESS_HOST` | адрес (по умолчанию `127.0.0.1`: debug-профиль работает на loopback) |
+| `XRN_HARNESS_PORT` | хост: порт для bind (`0` — эфемерный, публикуется в `<run-dir>/transport.port`) |
+| `XRN_HARNESS_HOST_PORT` | клиент: порт хоста (`0` — взять из `<run-dir>/transport.port`) |
+| `XRN_HARNESS_NET_TIMEOUT_MS` | таймаут молчания транспорта (по умолчанию 20000 мс: хост успевает загрузить уровень, прежде чем клиент сдастся) |
+| `XRN_HARNESS_NET_KEEPALIVE_MS` | интервал keepalive (0 = значение транспорта) |
 
 Таблица `coop_runtime` (Luabind) отдаёт `available/start/status/command`;
 Lua-фасад — `gamedata/scripts/coop_core.script` (`coop_core.*`).
@@ -60,6 +67,42 @@ Lua-фасад — `gamedata/scripts/coop_core.script` (`coop_core.*`).
 убили между сбросами. Формат — ровно `xrn::core::obs::EventLog::write_jsonl`,
 поэтому его читают `xrn_core_runlog merge` и `testrun.sh diff` (F0-14).
 
+## 3.1. Транспорт F0-02 (`xnt`, UDP)
+
+Harness-профиль по умолчанию идёт **по сети**, а не через `InProcessNetwork`:
+
+```
+CTransport (coop/coop_transport.*)          xnt C ABI (src/transport/include/xnt/transport.h)
+  host: xnt_host_create(addr, port)   ->    xrn::core::HostTransportLink
+  client: xnt_client_create(addr, port) ->  xrn::core::ClientTransportLink
+```
+
+* `transport_link.cpp` ядра (единственный файл, привязанный к C ABI) собран в
+  xrGame; транспорт линкуется статически (`XNT_STATIC`), поэтому рядом с exe не
+  нужен отдельный DLL; `ws2_32.lib` добавлен в зависимости проекта.
+* При старте проверяется версия ABI (`xnt_abi_version()` против
+  `XNT_ABI_VERSION`), а версия транспорта и отчёт о бэкендах
+  (`xnt_backend_status()`: `builtin-udp`/`gns`/`steam`/`enet`) попадают в
+  `SCoreStatus::transport` и в событие `session.start` лога F0-07 — прогон
+  видно, каким путём он шёл.
+* Сбой старта транспорта **не** откатывается молча на `InProcessNetwork`:
+  процесс помечается `degraded` с ошибкой, сессия не создаётся, артефакт
+  содержит `udp unavailable: ...`.
+* `InProcessNetwork` остаётся только для локальных проверок
+  (`XRN_HARNESS_NET=inprocess`): `tests/cpp/coop/run_core.sh` гоняет оба профиля.
+* Клиентская сторона читает состояние только из снапшотов: `ClientMirror` →
+  `inv::ItemDirectory`/`act::ActorDirectory` → наблюдения бота (`inventory`,
+  `world_items`, `players`). Предмет бот адресует классом (`bread`), id
+  разрешается в том, что он видит (у хоста — в авторитетном инвентаре).
+* Команды debug-поверхности — механика хоста: клиентский процесс отправляет их
+  интентом по мосту (`coop.debug.intent`), хост исполняет и отвечает
+  (`coop.debug.ack`, широковещательно, по `seq`), бот получает ответ только
+  после вердикта хоста. В in-process профиле команда исполняется локально, как
+  раньше.
+* Сетка слотов: хост + 3 клиента = 4 слота. Поэтому в сетевом профиле у хоста
+  **нет** loopback-пира: его бот действует как собственный игрок хоста (слот 0),
+  а слоты 1..3 занимают реальные клиентские процессы.
+
 ## 4. Debug-поверхность (`PLAN §8.11`)
 
 Команды бота (`action = send`, `command = "<name> <argument>"`) идут в
@@ -70,8 +113,8 @@ Lua-фасад — `gamedata/scripts/coop_core.script` (`coop_core.*`).
 | `debug.weather [type=fog]` | прокручивает цикл погоды хоста на один шаг (≥ одного dwell) | `weather` |
 | `debug.emission start` | `EnvironmentAuthority::trigger_emission()` | `emission_start` |
 | `debug.clock sync` | `set_world_time(+1 игровая минута)` | `time_sync` |
-| `debug.reconnect window=ok` | отбрасывает loopback-пира и возвращает его внутри окна | `player_rejoin` |
-| `debug.reconnect window=expired` | то же, но возврат после закрытия окна (600 мс в debug-профиле) | `window_expired` |
+| `debug.reconnect window=ok` | отбрасывает loopback-пира и возвращает его внутри окна (in-process профиль; в сетевом — `debug_unsupported`) | `player_rejoin` |
+| `debug.reconnect window=expired` | то же, но возврат после закрытия окна (600 мс в debug-профиле), также только in-process | `window_expired` |
 
 `debug.cfg_probe` и `debug.level_change` пока **не** реализованы: адаптер
 отвечает `done`, но публикует `debug_unsupported` с причиной, чтобы сценарий
@@ -79,15 +122,26 @@ e2e падал на ассерте события, а не «зеленел» м
 
 ## 5. Ограничения (честно)
 
-* **Транспорт F0-02 не подключён.** Процессы работают на
-  `xrn::core::InProcessNetwork`; у хоста есть loopback-пир (реальная
-  `ClientSession`), поэтому интент бота проходит настоящий путь
-  `ClientSession → HostSession → вердикт`. Межпроцессный обмен появится, когда
-  `transport_link.cpp` будет собран в движке (файл намеренно исключён из сборки:
-  он единственный привязан к C ABI транспорта). Ничего в адаптере для этого
-  менять не нужно — `HostSession`/`ClientSession` уже принимают `IMessageLink`.
+* **Транспорт F0-02 подключён (UDP), но debug-поверхность ещё не полностью
+  кросс-процессная.**
+  - `debug.reconnect` работает только в in-process профиле: он отбрасывает
+    loopback-пира хоста. Чтобы дропнуть конкретного удалённого клиента нужен
+    API транспорта/ядра (`xnt_host` не умеет разрывать сессию, `HostSession::kick`
+    освобождает слот сразу и не запускает окно реконнекта). В сетевом профиле
+    команда честно отвечает `debug_unsupported`.
+  - События мира (`player_rejoin`, `window_expired`, `weather`, ...) пишет
+    канал того процесса, который их наблюдал: у клиентов нет широковещательной
+    рассылки наблюдений хоста. Ассерты `observer = peer` на событиях пока
+    выполняются только для in-process профиля.
+  - `debug.cfg_probe` / `debug.level_change` по-прежнему не реализованы.
+* **GNS не линкуется.** `xnt` — самостоятельный транспорт: надёжная/ненадёжная
+  доставка, фрагментация, RTT и keepalive реализованы в самом `xnt` поверх
+  обычного UDP, а GameNetworkingSockets v1.6.1 остаётся его LAN-швом
+  (`XNET_WITH_GNS`, требует protobuf/OpenSSL). В отчёте бэкендов это видно как
+  `gns: unavailable — built without XNET_WITH_GNS`.
 * **Компиляция движка — только CI (MSVC/VS2022, F0-01).** Локально проверены:
-  адаптер против реального ядра (`tests/cpp/coop/run_core.sh`, g++),
+  адаптер против реального ядра: `tests/cpp/coop/run_core.sh` (g++ и clang++,
+  in-process профиль + два процесса по UDP),
   файловый канал/JSON (`tests/cpp/coop/run.sh`) и Lua-слой
   (`tests/lua/coop/run.lua`, 56 тестов).
 * **`tools/diff/merge.py` (xray-net) отстал от формата.** Python-фолбэк
@@ -108,6 +162,7 @@ e2e падал на ассерте события, а не «зеленел» м
 | Файл | Роль |
 |---|---|
 | `src/xrGame/coop/coop_core_runtime.{h,cpp}` | тик, сессии, события среды, артефакты, debug-команды |
+| `src/xrGame/coop/coop_transport.{h,cpp}` | F0-02: загрузка `xnt`, host/client эндпоинт, публикация эфемерного порта, отчёт о транспорте |
 | `src/xrGame/coop/coop_core_script.{h,cpp}` | Lua-таблица `coop_runtime` |
 | `src/xrGame/coop/coop_bot_json.{h,cpp}` | минимальный JSON протокола ботов (без движка) |
 | `src/xrGame/coop/coop_bot_channel.{h,cpp}` | inbox/outbox/observations протокола ботов (без движка) |

@@ -5190,6 +5190,9 @@
     <ClInclude Include="coop\coop_core_script.h">
       <Filter>Coop</Filter>
     </ClInclude>
+    <ClInclude Include="coop\coop_transport.h">
+      <Filter>Coop</Filter>
+    </ClInclude>
     <ClInclude Include="base_client_classes.h">
       <Filter>AI\AScript\ScriptClasses\BaseClientClasses</Filter>
     </ClInclude>
@@ -8835,6 +8838,9 @@
       <Filter>Coop</Filter>
     </ClCompile>
     <ClCompile Include="coop\coop_core_script.cpp">
+      <Filter>Coop</Filter>
+    </ClCompile>
+    <ClCompile Include="coop\coop_transport.cpp">
       <Filter>Coop</Filter>
     </ClCompile>
     <ClCompile Include="base_client_classes_script.cpp">

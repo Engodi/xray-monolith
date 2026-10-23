@@ -21,14 +21,18 @@
 
 #include "coop/coop_bot_channel.h"
 #include "coop/coop_bridge.h"
+#include "coop/coop_transport.h"
 #include "xrn/core/actor.hpp"
 #include "xrn/core/bridge_seam.hpp"
+#include "xrn/core/connection.hpp"
 #include "xrn/core/environment.hpp"
 #include "xrn/core/error.hpp"
 #include "xrn/core/inventory.hpp"
 #include "xrn/core/link.hpp"
+#include "xrn/core/mirror.hpp"
 #include "xrn/core/observability.hpp"
 #include "xrn/core/session.hpp"
+#include "xrn/core/transport_link.hpp"
 #include "xrn/core/world.hpp"
 
 #include "ai_space.h"
@@ -42,6 +46,7 @@ namespace obs = xrn::core::obs;
 namespace env = xrn::core::env;
 namespace act = xrn::core::actor;
 namespace inv = xrn::core::inventory;
+namespace rep = xrn::replication;
 using xrn::core::BridgeMessage;
 using xrn::core::ClientSession;
 using xrn::core::CoreError;
@@ -68,6 +73,15 @@ constexpr PeerId kLoopbackPeerId = 2;
 // Matches `ClientTransportLink::kHostPeerId`: whatever the transport, the
 // client sees exactly one logical peer.
 constexpr PeerId kClientPeerId = 1;
+// The host's own player row (`xrn::core::kHostPlayerId`): in the network
+// profile the host bot acts as this player, not through a loopback client.
+constexpr xrn::core::PlayerId kHostLocalPlayerId = xrn::core::kHostPlayerId;
+// Debug surface over the network (F0-02): a bot command is a host-side mechanic,
+// so a client process sends it as an intent and answers its bot only when the
+// host's verdict comes back. Intent payload: `name\nargument`; ack: `status\ndetail`.
+constexpr const char* kDebugIntentChannel = "coop.debug.intent";
+constexpr const char* kDebugAckChannel = "coop.debug.ack";
+constexpr char kDebugFieldSeparator = '\n';
 constexpr const char* kDefaultLevel = "l01_escape";
 constexpr const char* kDebugItem = "bread";
 
@@ -117,11 +131,16 @@ struct CCoreRuntime::SImpl {
     bool active = false;
     bool host = false;
     bool started = false;
+    // True when the profile asked for the real transport (default in a harness
+    // run) instead of the in-process queues (`XRN_HARNESS_NET=inprocess`).
+    bool udp = true;
     std::string role;
     std::string instance;
     std::string run_dir;
     std::string level = kDefaultLevel;
     std::string error;
+    // "xnt 0.1.0 (abi 1) udp host 127.0.0.1:47000 - backends: ..." (F0-02).
+    std::string transport;
 
     // --- core ----------------------------------------------------------------
     std::unique_ptr<obs::EventLog> log;
@@ -129,16 +148,30 @@ struct CCoreRuntime::SImpl {
     std::unique_ptr<env::EnvironmentAuthority> environment;
     std::unique_ptr<act::ActorReplicator> actors;
     std::unique_ptr<inv::InventoryAuthority> inventory;
+    // In-process profile only: deterministic queues for local checks.
     std::unique_ptr<InProcessNetwork> net;
-    std::unique_ptr<IMessageLink> link;
+    // Network profile: the F0-02 endpoint (owns the xnt host/client object).
+    std::unique_ptr<CTransport> endpoint;
+    // In-process profile: the host endpoint the session borrows through `link`.
+    std::unique_ptr<IMessageLink> owned_link;
+    // Borrowed from `net`/`endpoint`; never deleted through this pointer.
+    IMessageLink* link = nullptr;
     std::unique_ptr<HostSession> host_session;
     std::unique_ptr<ClientSession> client_session;
-    // Debug loopback peer of the host profile: a real ClientSession on the
-    // in-process link, so a bot intent travels the same path as a remote one
-    // (peer -> HostSession -> host authority -> verdict) until the F0-02
-    // transport is wired into the engine.
+    // In-process profile: the host's own bot acts through a real ClientSession
+    // on the in-process link (peer -> HostSession -> host authority -> verdict).
+    // The network profile has no such peer: the slot budget (3 peer slots) is
+    // reserved for the real client processes.
     std::unique_ptr<IMessageLink> peer_link;
     std::unique_ptr<ClientSession> peer_session;
+    // Client read model: the mirrored snapshots are what a client process can
+    // observe (inventory, world items, actors).
+    act::ActorDirectory actor_view;
+    inv::ItemDirectory item_view;
+    std::uint32_t view_sequence = 0;
+    bool view_ready = false;
+    // Player id of this process' own character (host row / client slot).
+    xrn::core::PlayerId local_player_id = kHostLocalPlayerId;
 
     // --- engine bridge (F0-05) ----------------------------------------------
     // `coop::bridge()` (Lua) <-> core `BridgeLink` of the local session.
@@ -182,8 +215,9 @@ struct CCoreRuntime::SImpl {
     std::int64_t accumulator_ms = 0;
     std::int64_t last_state_ms = 0;
     std::int64_t last_flush_ms = 0;
-    std::uint32_t debug_item = 0;
+    rep::EntityId debug_item = 0;
     std::uint32_t next_request = 0;
+    std::uint32_t item_sequence = 0;
     bool lua_started = false;
 
     // Reconnect scenario (`debug.reconnect`): 0 idle, 1 dropped, 2 returning.
@@ -202,6 +236,9 @@ struct CCoreRuntime::SImpl {
         std::uint32_t request = 0;
         std::string item;
         std::int64_t deadline_ms = 0;
+        // A debug command forwarded to the host (network profile); its verdict
+        // arrives on `kDebugAckChannel`, not as a pickup ack.
+        bool debug = false;
     };
     std::vector<SPendingAction> pending;
 
@@ -267,6 +304,38 @@ struct CCoreRuntime::SImpl {
         }
     }
 
+    // --- inventory events -> observations + Lua seam (F1-02) ----------------
+    //
+    // The authority is the single source of truth for "the item moved". The host
+    // bot channel observes the pickups here (in the in-process profile the
+    // loopback peer's ack did it), and the same events go to the Lua seam.
+    void observe_item_events() {
+        if (inventory == nullptr) {
+            return;
+        }
+        const std::vector<inv::ItemEvent> events = inventory->take_events();
+        if (events.empty()) {
+            return;
+        }
+        for (const inv::ItemEvent& event : events) {
+            if (event.kind == inv::ItemEventKind::PickedUp) {
+                channel.observe_event(
+                    "pickup",
+                    {{"item", bot::SJson::make_string(event.view.item)},
+                     {"count", bot::SJson::make_number(static_cast<double>(event.view.count))}});
+            } else if (event.kind == inv::ItemEventKind::Dropped) {
+                channel.observe_event(
+                    "drop",
+                    {{"item", bot::SJson::make_string(event.view.item)},
+                     {"count", bot::SJson::make_number(static_cast<double>(event.view.count))}});
+            }
+        }
+        if (host_session != nullptr) {
+            static_cast<void>(
+                inv::publish_item_events(host_session->bridge(), events, item_sequence));
+        }
+    }
+
     // --- connection lifecycle -> observations (F0-08/F1-10/F0-09) -----------
     void observe_session_deltas() {
         if (host_session == nullptr) {
@@ -297,8 +366,12 @@ struct CCoreRuntime::SImpl {
     //
     // The in-process link keeps events for a peer id until somebody polls them:
     // a peer that vanished must be drained, otherwise its successor would read
-    // the *previous* Disconnected event and end before joining.
+    // the *previous* Disconnected event and end before joining. A network
+    // endpoint is destroyed instead, so there is nothing to drain.
     void drain_peer_inbox() {
+        if (net == nullptr) {
+            return;
+        }
         std::unique_ptr<IMessageLink> scratch = net->endpoint(kLoopbackPeerId);
         std::vector<xrn::core::LinkEvent> events;
         while (scratch->poll(events)) {
@@ -306,13 +379,36 @@ struct CCoreRuntime::SImpl {
         }
     }
 
-    void step_reconnect_cycle(std::int64_t now) {
-        if (reconnect_phase == 1) {
+    // Creates the host's own bot as a real client of the host session. Only the
+    // in-process profile has it: over the network the peer slots belong to the
+    // real client processes (host + 3 clients = the 4-slot session).
+    bool start_local_peer() {
+        if (net == nullptr) {
+            return false;
+        }
+        xrn::core::ClientConfig config;
+        config.host_peer = kHostPeerId;
+        config.player_id = kLoopbackPeerId;
+        config.player_name = instance + "-bot";
+        peer_link = net->endpoint(kLoopbackPeerId);
+        peer_session.reset(new ClientSession(*peer_link, config));
+        net->connect(kHostPeerId, kLoopbackPeerId);
+        return true;
+    }
+
+    void drop_local_peer() {
+        if (net != nullptr) {
             // Drop the loopback peer exactly like a lost client process.
             net->disconnect(kHostPeerId, kLoopbackPeerId);
-            peer_session.reset();
-            peer_link.reset();
-            drain_peer_inbox();
+        }
+        peer_session.reset();
+        peer_link.reset();
+        drain_peer_inbox();
+    }
+
+    void step_reconnect_cycle(std::int64_t now) {
+        if (reconnect_phase == 1) {
+            drop_local_peer();
             reconnect_at_ms =
                 now +
                 (reconnect_expired ? static_cast<std::int64_t>(kDebugReconnectWindowMs) + 150 : 40);
@@ -321,18 +417,115 @@ struct CCoreRuntime::SImpl {
         }
         if (reconnect_phase == 2 && now >= reconnect_at_ms) {
             drain_peer_inbox();
-            xrn::core::ClientConfig config;
-            config.host_peer = kHostPeerId;
-            config.player_id = 1;
-            config.player_name = instance + "-bot";
-            peer_link = net->endpoint(kLoopbackPeerId);
-            peer_session.reset(new ClientSession(*peer_link, config));
-            net->connect(kHostPeerId, kLoopbackPeerId);
+            static_cast<void>(start_local_peer());
             reconnect_phase = 0;
         }
     }
 
+    // --- client read model (F0-02: what a snapshot looks like on a client) ---
+    //
+    // The core applies snapshots/deltas into `ClientMirror`; the directories turn
+    // those records into the observable state the bot channel and the Lua layer
+    // read. Refreshed only when the authoritative sequence moved (the host
+    // publishes every 100 ms), never per frame.
+    void refresh_client_view() {
+        if (client_session == nullptr) {
+            return;
+        }
+        const std::uint32_t sequence = client_session->mirror().last_sequence();
+        if (view_ready && sequence == view_sequence) {
+            return;
+        }
+        view_ready = true;
+        view_sequence = sequence;
+        const std::vector<rep::EntityRecord> records = client_session->mirror().records();
+        actor_view.refresh(records, local_player_id);
+        item_view.refresh(records, local_player_id);
+    }
+
+    // --- debug surface over the network (F0-02) ------------------------------
+    //
+    // A debug command is a host-side mechanic: the client sends it as an intent
+    // (`kDebugIntentChannel`), the host executes it and broadcasts the verdict
+    // (`kDebugAckChannel`). Only armed in the harness profile, like the surface
+    // itself; the payload never crosses into Lua.
+    static std::string encode_debug(const std::string& name, const std::string& argument) {
+        return name + kDebugFieldSeparator + argument;
+    }
+
+    static void split_debug(const std::string& payload, std::string& name, std::string& argument) {
+        const std::size_t separator = payload.find(kDebugFieldSeparator);
+        if (separator == std::string::npos) {
+            name = payload;
+            argument.clear();
+            return;
+        }
+        name = payload.substr(0, separator);
+        argument = payload.substr(separator + 1);
+    }
+
+    // Host: executes the debug intents peers sent and answers them. Everything
+    // else stays in the local bridge for the Lua layer (the queue is drained
+    // destructively, so foreign messages are handed over explicitly).
+    void drain_debug_intents() {
+        if (host_session == nullptr) {
+            return;
+        }
+        std::vector<BridgeMessage> foreign;
+        BridgeMessage message;
+        while (host_session->bridge().pull_inbound(message)) {
+            if (message.channel != kDebugIntentChannel) {
+                foreign.push_back(std::move(message));
+                continue;
+            }
+            std::string name;
+            std::string argument;
+            split_debug(message.payload, name, argument);
+            std::string detail;
+            const bool accepted = coop::core_runtime().command(name, argument, detail);
+            if (accepted) {
+                channel.observe_event("debug_command", {{"command", bot::SJson::make_string(name)},
+                                                        {"detail", bot::SJson::make_string(detail)}});
+            } else {
+                // Honest answer: the surface exists, the mechanic is not wired.
+                channel.observe_event(
+                    "debug_unsupported",
+                    {{"command", bot::SJson::make_string(name)},
+                     {"reason", bot::SJson::make_string(detail)}});
+            }
+            BridgeMessage ack;
+            ack.seq = message.seq;
+            ack.channel = kDebugAckChannel;
+            ack.payload = std::string(accepted ? "done" : "failed") + kDebugFieldSeparator + detail;
+            static_cast<void>(host_session->broadcast_bridge(ack));
+        }
+        for (BridgeMessage& kept : foreign) {
+            coop::bridge().enqueue(xrn::core::to_engine<coop::SMessage>(std::move(kept)));
+        }
+    }
+
     // --- bot actions (F0-12) -------------------------------------------------
+    //
+    // The scenario names an item class ("bread"), the wire carries ids. A client
+    // has no authoritative inventory: it resolves the class in the world items it
+    // mirrors, exactly like a player picking up what it sees. The host resolves
+    // it in its own authority.
+    rep::EntityId resolve_item(const std::string& item_class) {
+        if (inventory != nullptr) {
+            for (const inv::ItemView& item : inventory->world_items()) {
+                if (item.item == item_class) {
+                    return item.key.entity;
+                }
+            }
+        }
+        for (const inv::ItemView& item : item_view.world_items()) {
+            if (item.item == item_class) {
+                return item.key.entity;
+            }
+        }
+        return 0;
+    }
+
     void answer(const bot::SInboxMessage& message, const char* status, std::int64_t started_ms,
                 const std::string& failure = std::string()) {
         channel.ack(message, status, std::max<std::int64_t>(0, epoch_ms() - started_ms), failure);
@@ -341,6 +534,9 @@ struct CCoreRuntime::SImpl {
     void handle_action(const bot::SInboxMessage& message, std::int64_t now) {
         const bot::SAction& action = message.action;
         const std::int64_t started = message.sent_at_ms > 0 ? message.sent_at_ms : now;
+        // A bot acts on what it can see: the mirrored state must be current when
+        // the action names an item (a client resolves classes through it).
+        refresh_client_view();
 
         if (action.type == "send" || action.type == "net_action") {
             std::string detail;
@@ -350,6 +546,28 @@ struct CCoreRuntime::SImpl {
                 space == std::string::npos ? std::string() : action.command.substr(space + 1);
             if (name.empty()) {
                 answer(message, "failed", started, "empty command");
+                return;
+            }
+            if (!host) {
+                // F0-02: a debug command is a host-side mechanic. A client sends
+                // it as an intent over the session bridge and answers its bot only
+                // when the host's verdict arrives over the network.
+                if (client_session == nullptr || !client_session->join_accepted()) {
+                    answer(message, "failed", started, "no session for the debug intent");
+                    return;
+                }
+                BridgeMessage intent;
+                intent.seq = ++next_request;
+                intent.channel = kDebugIntentChannel;
+                intent.payload = encode_debug(name, argument);
+                client_session->bridge().on_outbound(intent);
+
+                SPendingAction pending_action;
+                pending_action.message = message;
+                pending_action.request = intent.seq;
+                pending_action.debug = true;
+                pending_action.deadline_ms = now + kAckTimeoutMs;
+                pending.push_back(std::move(pending_action));
                 return;
             }
             if (!coop::core_runtime().command(name, argument, detail)) {
@@ -369,16 +587,50 @@ struct CCoreRuntime::SImpl {
         }
 
         if (action.type == "pickup") {
-            if (debug_item == 0) {
+            const rep::EntityId item = action.item.empty() ? debug_item : resolve_item(action.item);
+            if (item == 0) {
                 channel.observe_event("pickup_rejected",
                                       {{"item", bot::SJson::make_string(action.item)},
                                        {"reason", bot::SJson::make_string("no_item")}});
                 answer(message, "done", started);
                 return;
             }
+            if (peer_session == nullptr && client_session == nullptr) {
+                // Network profile: the host bot acts as the host's own player
+                // (slot 0). No loopback peer exists there - the peer slots belong
+                // to the real client processes - so the intent goes straight to
+                // the authority that owns the item.
+                if (inventory == nullptr) {
+                    answer(message, "failed", started, "no inventory authority");
+                    return;
+                }
+                inv::PickupRequest request;
+                request.slot = rep::kHostWriter;
+                request.player_id = kHostLocalPlayerId;
+                request.request = ++next_request;
+                request.item = item;
+                if (actors != nullptr) {
+                    request.picker_position = actors->spawn_position(rep::kHostWriter);
+                }
+                const inv::PickupVerdict verdict = inventory->pickup(request);
+                if (verdict.applied()) {
+                    channel.observe_event(
+                        "pickup",
+                        {{"item", bot::SJson::make_string(verdict.item_class)},
+                         {"count", bot::SJson::make_number(static_cast<double>(verdict.count))}});
+                } else {
+                    channel.observe_event(
+                        "pickup_rejected",
+                        {{"item", bot::SJson::make_string(verdict.item_class.empty() ? action.item
+                                                                                     : verdict.item_class)},
+                         {"reason", bot::SJson::make_string(inv::to_string(verdict.status))}});
+                }
+                answer(message, "done", started);
+                return;
+            }
             inv::PickupIntent intent;
             intent.request = ++next_request;
-            intent.item = debug_item;
+            intent.item = item;
             std::string payload;
             if (failed(inv::encode_pickup_intent(intent, payload))) {
                 answer(message, "failed", started, "cannot encode the intent");
@@ -422,6 +674,11 @@ struct CCoreRuntime::SImpl {
     }
 
     // --- host verdicts -> bot channel ---------------------------------------
+    //
+    // The verdicts of this process' own actions arrive on its own bridge: the
+    // in-process peer link in a local check, the client session over the network
+    // in a harness run. A debug command travels the same way and comes back on
+    // `kDebugAckChannel`.
     void drain_peer_verdicts(std::int64_t now) {
         for (std::size_t index = 0; index < pending.size();) {
             if (now >= pending[index].deadline_ms) {
@@ -433,11 +690,30 @@ struct CCoreRuntime::SImpl {
             ++index;
         }
 
-        if (peer_session == nullptr) {
+        xrn::core::BridgeLink* const source =
+            peer_session != nullptr
+                ? &peer_session->bridge()
+                : (client_session != nullptr ? &client_session->bridge() : nullptr);
+        if (source == nullptr) {
             return;
         }
         BridgeMessage message;
-        while (peer_session->bridge().pull_inbound(message)) {
+        while (source->pull_inbound(message)) {
+            if (message.channel == kDebugAckChannel) {
+                std::string status;
+                std::string detail;
+                split_debug(message.payload, status, detail);
+                for (std::size_t index = 0; index < pending.size(); ++index) {
+                    if (!pending[index].debug || pending[index].request != message.seq) {
+                        continue;
+                    }
+                    answer(pending[index].message, status.c_str(), pending[index].deadline_ms,
+                           detail);
+                    pending.erase(pending.begin() + static_cast<std::ptrdiff_t>(index));
+                    break;
+                }
+                continue;
+            }
             if (message.channel != inv::kAckChannel) {
                 // Not our business: hand it to the Lua gameplay layer.
                 coop::bridge().enqueue(xrn::core::to_engine<coop::SMessage>(message));
@@ -448,7 +724,7 @@ struct CCoreRuntime::SImpl {
                 continue;
             }
             for (std::size_t index = 0; index < pending.size(); ++index) {
-                if (pending[index].request != verdict.request) {
+                if (pending[index].debug || pending[index].request != verdict.request) {
                     continue;
                 }
                 if (verdict.applied()) {
@@ -473,7 +749,7 @@ struct CCoreRuntime::SImpl {
     }
 
     // --- observed state (contract `kind=state`) ------------------------------
-    bot::SObservedState observe_state() const {
+    bot::SObservedState observe_state() {
         bot::SObservedState state;
         state.actor.name = instance;
         state.actor.level = level;
@@ -504,13 +780,40 @@ struct CCoreRuntime::SImpl {
                     row.count = item.count;
                     state.world_items.push_back(row);
                 }
-                // The bot's own inventory is the one of its loopback peer.
-                for (const inv::ItemView& item : inventory->inventory_of(1)) {
+                // The bot's own inventory: the host row over the network, the
+                // in-process peer's player in a local check.
+                for (const inv::ItemView& item : inventory->inventory_of(local_player_id)) {
                     bot::SItemState row;
                     row.id = item.item;
                     row.count = item.count;
                     state.inventory.push_back(row);
                 }
+            }
+        } else if (client_session != nullptr) {
+            // A client sees only what the host replicated: the mirror-derived
+            // read model, refreshed from the snapshots/deltas of this tick.
+            refresh_client_view();
+            for (const act::ActorView& view : actor_view.all()) {
+                bot::SActorState row;
+                row.name = view.name.empty() ? ("slot-" + std::to_string(view.slot)) : view.name;
+                row.level = level;
+                row.x = view.position.x;
+                row.y = view.position.y;
+                row.z = view.position.z;
+                state.players.push_back(row);
+                state.session_players.push_back(row.name);
+            }
+            for (const inv::ItemView& item : item_view.world_items()) {
+                bot::SItemState row;
+                row.id = item.item;
+                row.count = item.count;
+                state.world_items.push_back(row);
+            }
+            for (const inv::ItemView& item : item_view.inventory()) {
+                bot::SItemState row;
+                row.id = item.item;
+                row.count = item.count;
+                state.inventory.push_back(row);
             }
         }
         if (state.session_players.empty()) {
@@ -617,7 +920,30 @@ bool CCoreRuntime::start() {
     impl.log.reset(new obs::EventLog(log_config));
 
     impl.world.reset(new WorldState());
-    impl.net.reset(new InProcessNetwork());
+
+    // F0-02: one transport endpoint per process. The harness profile goes over
+    // the network by default (loopback in the debug profile, so a local e2e
+    // needs no network setup); the in-process queues stay available for local
+    // checks that must not depend on sockets (`XRN_HARNESS_NET=inprocess`).
+    const STransportConfig transport_config = transport_config_from_env();
+    impl.udp = transport_config.udp;
+    bool wired = true;
+    if (impl.udp) {
+        impl.endpoint.reset(new CTransport());
+        if (impl.endpoint->start(transport_config)) {
+            impl.link = impl.endpoint->link();
+            impl.transport = impl.endpoint->description();
+        } else {
+            // No silent fallback: a run that lost its transport must be visible
+            // in the artifacts, not fake an in-process session.
+            impl.transport = "udp unavailable: " + impl.endpoint->error();
+            impl.note_error("transport: " + impl.endpoint->error());
+            wired = false;
+        }
+    } else {
+        impl.net.reset(new InProcessNetwork());
+        impl.transport = "in-process link (XRN_HARNESS_NET=inprocess)";
+    }
 
     if (impl.host) {
         impl.environment.reset(new env::EnvironmentAuthority(*impl.world));
@@ -632,25 +958,31 @@ bool CCoreRuntime::start() {
                 impl.inventory->spawn_item(kDebugItem, 1, entry->position).value_or(0);
         }
 
-        xrn::core::HostConfig config;
-        config.log = impl.log.get();
-        config.actors = impl.actors.get();
-        config.inventory = impl.inventory.get();
-        config.environment = impl.environment.get();
-        config.host_name = impl.instance;
-        config.hash_every_publishes = 5;
-        config.reconnect.window_ms = kDebugReconnectWindowMs;
-        impl.link = impl.net->endpoint(kHostPeerId);
-        impl.host_session.reset(new HostSession(*impl.world, *impl.link, config));
-
-        xrn::core::ClientConfig peer_config;
-        peer_config.host_peer = kHostPeerId;
-        peer_config.player_id = 1;
-        peer_config.player_name = impl.instance + "-bot";
-        impl.peer_link = impl.net->endpoint(kLoopbackPeerId);
-        impl.peer_session.reset(new ClientSession(*impl.peer_link, peer_config));
-        impl.net->connect(kHostPeerId, kLoopbackPeerId);
-    } else {
+        if (wired) {
+            xrn::core::HostConfig config;
+            config.log = impl.log.get();
+            config.actors = impl.actors.get();
+            config.inventory = impl.inventory.get();
+            config.environment = impl.environment.get();
+            config.host_name = impl.instance;
+            config.hash_every_publishes = 5;
+            config.reconnect.window_ms = kDebugReconnectWindowMs;
+            if (impl.net != nullptr) {
+                // In-process profile: the endpoint is owned by the network object.
+                impl.link = impl.net->endpoint(kHostPeerId).release();
+                impl.owned_link.reset(impl.link);
+            }
+            impl.host_session.reset(new HostSession(*impl.world, *impl.link, config));
+            impl.local_player_id = kHostLocalPlayerId;
+            // Only the in-process profile gives the host a bot peer; over the
+            // network the peer slots hold the real client processes.
+            if (!impl.udp) {
+                if (impl.start_local_peer()) {
+                    impl.local_player_id = kLoopbackPeerId;
+                }
+            }
+        }
+    } else if (wired) {
         xrn::core::ClientConfig config;
         config.host_peer = kClientPeerId;
         config.player_id = env_uint("XRN_HARNESS_SLOT", 1) + 1;
@@ -658,7 +990,11 @@ bool CCoreRuntime::start() {
         config.log = impl.log.get();
         // Listen-host semantics: a vanished host ends the session (EC-4).
         config.host_loss_grace_ms = 0;
-        impl.link = impl.net->endpoint(kClientPeerId);
+        impl.local_player_id = config.player_id;
+        if (impl.net != nullptr) {
+            impl.link = impl.net->endpoint(kClientPeerId).release();
+            impl.owned_link.reset(impl.link);
+        }
         impl.client_session.reset(new ClientSession(*impl.link, config));
     }
 
@@ -675,9 +1011,9 @@ bool CCoreRuntime::start() {
     }
 
     if (impl.log != nullptr) {
-        impl.log->session_start(0, impl.host
-                                       ? "headless host, in-process link (transport seam ready)"
-                                       : "headless client, transport seam ready");
+        const std::string detail = std::string(impl.host ? "headless host, " : "headless client, ") +
+                                   impl.transport;
+        impl.log->session_start(0, detail);
     }
 
     impl.last_flush_ms = epoch_ms();
@@ -708,7 +1044,10 @@ void CCoreRuntime::shutdown() {
     impl.client_session.reset();
     impl.peer_session.reset();
     impl.peer_link.reset();
-    impl.link.reset();
+    // The sessions are gone: the link and its endpoint may be released now.
+    impl.link = nullptr;
+    impl.owned_link.reset();
+    impl.endpoint.reset();
     impl.net.reset();
     impl.inventory.reset();
     impl.actors.reset();
@@ -760,6 +1099,9 @@ void CCoreRuntime::tick() {
             }
             if (impl.host_session != nullptr) {
                 impl.host_session->service();
+                // F0-02: a client's debug intent is executed before the publish
+                // of this step, so its effect leaves in the same delta.
+                impl.drain_debug_intents();
             }
             if (impl.environment != nullptr && impl.host_session != nullptr) {
                 static_cast<void>(impl.environment->advance_real_ms(kStepMs));
@@ -773,6 +1115,7 @@ void CCoreRuntime::tick() {
                 }
                 impl.host_session->publish();
             }
+            impl.observe_item_events();
             impl.observe_session_deltas();
             impl.step_reconnect_cycle(now);
         } else if (impl.client_session != nullptr) {
@@ -780,11 +1123,12 @@ void CCoreRuntime::tick() {
         }
     }
 
+    // Host verdicts -> bot channel (F0-12). Drains the process' own bridge
+    // before the Lua pump: a pickup/debug verdict is the bot's, not Lua data.
+    impl.drain_peer_verdicts(now);
+
     // Core -> Lua (F0-05): event-driven dispatch only.
     static_cast<void>(coop::bridge().pump());
-
-    // Host verdicts -> bot channel (F0-12).
-    impl.drain_peer_verdicts(now);
 
     bot::SInboxMessage message;
     while (impl.channel.ready() && impl.channel.poll(message)) {
@@ -877,6 +1221,7 @@ SCoreStatus CCoreRuntime::status() const {
     status.role = impl.role;
     status.instance = impl.instance;
     status.run_dir = impl.run_dir;
+    status.transport = impl.transport;
     if (impl.active) {
         status.log_path = (fs::path(impl.run_dir) / (impl.instance + ".jsonl")).string();
     }
@@ -884,6 +1229,8 @@ SCoreStatus CCoreRuntime::status() const {
     status.steps = impl.steps;
     status.world_tick = impl.world != nullptr ? impl.world->tick() : 0;
     status.events = impl.log != nullptr ? impl.log->size() : 0;
+    status.joined = impl.host_session != nullptr ||
+                    (impl.client_session != nullptr && impl.client_session->join_accepted());
     if (impl.host_session != nullptr) {
         for (const xrn::core::SessionPlayer& player : impl.host_session->players()) {
             if (player.state == xrn::core::PlayerState::Connected) {

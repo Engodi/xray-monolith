@@ -46,10 +46,12 @@ struct SCoreStatus {
     std::string instance;          // harness instance name ("host", "client-1", ...)
     std::string run_dir;           // <run-dir> of the run
     std::string log_path;          // <run-dir>/<instance>.jsonl
+    std::string transport;         // F0-02: "xnt <ver> (abi N) udp host 127.0.0.1:port"
     std::string error;             // last start/wiring error
     std::uint32_t steps = 0;       // core ticks executed
     std::uint32_t world_tick = 0;  // authoritative tick (host) / host tick (client)
     std::uint32_t peers = 0;       // players in the session
+    bool joined = false;           // client: the host accepted the join
     std::size_t events = 0;        // events in the F0-07 log ring
 };
 

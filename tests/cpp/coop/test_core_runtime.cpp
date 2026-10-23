@@ -110,6 +110,9 @@ int main() {
     setenv("XRN_HARNESS_INSTANCE", "host", 1);
     setenv("XRN_HARNESS_ROLE", "host", 1);
     setenv("XRN_HARNESS_SLOT", "0", 1);
+    // This check is about the adapter logic, not sockets: the in-process profile
+    // keeps it deterministic. The cross-process run is test_cross_process.cpp.
+    setenv("XRN_HARNESS_NET", "inprocess", 1);
 
     coop::CCoreRuntime& runtime = coop::core_runtime();
     // The engine only calls tick() (CLevel::OnFrame): the first frame arms the
