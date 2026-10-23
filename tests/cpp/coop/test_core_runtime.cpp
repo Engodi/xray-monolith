@@ -7,7 +7,8 @@
 //	  * the harness profile is armed through the F0-11 environment;
 //	  * the core ticks at a fixed step, hosts a loopback peer and publishes
 //	    environment events;
-//	  * debug commands drive the host authority (weather / emission / clock);
+//	  * debug commands drive the host authority (weather / emission / clock /
+//	    reconnect / build probe / group level change);
 //	  * the bot file channel is served end-to-end: inbox action -> host verdict
 //	    -> outbox ack + observations;
 //	  * `<run-dir>/<instance>.jsonl` is a valid F0-07 artifact (`obs::read_jsonl`).
@@ -165,6 +166,40 @@ int main() {
                 "run-1");
     pump(runtime, 120, 10);
     check(has_observation(observations, "\"event\":\"window_expired\""), "expired window observed");
+
+    // --- build comparison (F0-09, AC-1.10) ----------------------------------
+    push_action(inbox, 7, "\"type\":\"send\",\"command\":\"debug.cfg_probe\"", "run-1");
+    pump(runtime, 5);
+    check(fs::exists(root / "host" / "bot" / "outbox" / "0007.json"), "build probe acked");
+    check(has_observation(observations, "\"event\":\"cfg_check\""), "build check observed");
+    check(!has_observation(observations, "\"event\":\"join_rejected\""),
+          "a matching build publishes no join_rejected");
+
+    // The in-process profile wires no build gate (its loopback peer is a local
+    // check, not a joining player), so a divergent probe has to fail honestly
+    // instead of pretending the build was refused by a host verdict.
+    push_action(inbox, 8,
+                "\"type\":\"send\",\"command\":\"debug.cfg_probe mismatch=weapon_ammo.ltx\"",
+                "run-1");
+    pump(runtime, 5);
+    check(has_observation(observations, "a divergent build needs a connected peer"),
+          "a divergent probe without a gate is refused honestly");
+
+    // --- group level change (F1-13, AC-3.3) ---------------------------------
+    push_action(inbox, 9,
+                "\"type\":\"send\",\"command\":\"debug.level_change level=l02_darkvalley\"",
+                "run-1");
+    pump(runtime, 40, 20);
+    check(fs::exists(root / "host" / "bot" / "outbox" / "0009.json"), "level change acked");
+    check(has_observation(observations, "\"event\":\"level_change\""), "level change observed");
+    check(has_observation(observations, "\"level\":\"l02_darkvalley\""),
+          "the group stands in the target map");
+
+    push_action(inbox, 10, "\"type\":\"send\",\"command\":\"debug.level_change level=l99_unknown\"",
+                "run-1");
+    pump(runtime, 5);
+    check(has_observation(observations, "unknown level: l99_unknown"),
+          "an unknown level is refused with its name");
 
     // --- observability artifact (F0-07) -------------------------------------
     runtime.shutdown();

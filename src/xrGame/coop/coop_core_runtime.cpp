@@ -22,12 +22,16 @@
 #include "coop/coop_bot_channel.h"
 #include "coop/coop_bridge.h"
 #include "coop/coop_transport.h"
+#include "xrn/cfgdiff/diff.hpp"
+#include "xrn/cfgdiff/handshake.hpp"
+#include "xrn/cfgdiff/manifest.hpp"
 #include "xrn/core/actor.hpp"
 #include "xrn/core/bridge_seam.hpp"
 #include "xrn/core/connection.hpp"
 #include "xrn/core/environment.hpp"
 #include "xrn/core/error.hpp"
 #include "xrn/core/inventory.hpp"
+#include "xrn/core/level.hpp"
 #include "xrn/core/link.hpp"
 #include "xrn/core/mirror.hpp"
 #include "xrn/core/observability.hpp"
@@ -46,6 +50,8 @@ namespace obs = xrn::core::obs;
 namespace env = xrn::core::env;
 namespace act = xrn::core::actor;
 namespace inv = xrn::core::inventory;
+namespace lvl = xrn::core::level;
+namespace cfg = xrn::cfgdiff;
 namespace rep = xrn::replication;
 using xrn::core::BridgeMessage;
 using xrn::core::ClientSession;
@@ -96,6 +102,158 @@ constexpr std::uint32_t kClientReconnectGraceMs = kDebugReconnectWindowMs * 2;
 constexpr std::uint32_t kClientReconnectRetryMs = 50;
 constexpr const char* kDefaultLevel = "l01_escape";
 constexpr const char* kDebugItem = "bread";
+// F1-13 debug transition: a debug run does not walk into a level changer and does
+// not load a real map. The host commits as soon as the movers acknowledged the
+// token, or after this budget — a straggler then resyncs into the committed state
+// (AC-3.3.4), so a broken load can never freeze the group.
+constexpr std::int64_t kDebugLoadBudgetMs = 300;
+// F0-09 debug probe: the dropped peer must still receive the verdict of the
+// command that caused the drop, so the drop follows it after this delay.
+constexpr std::int64_t kDebugCfgDropDelayMs = 100;
+// A refusal list is a player-facing label: bounded like the F1-12 join notice.
+constexpr std::size_t kMaxProbePaths = 64;
+constexpr std::size_t kMaxProbePathBytes = 256;
+
+// --- F0-09: the harness build ------------------------------------------------
+//
+// A harness process has no gamedata tree to scan, so the adapter serves a
+// deterministic synthetic build: the same fixture list in every process, hashed
+// per path. A join therefore carries a real cfg-diff manifest (`cfgdiff::Probe`),
+// the host compares it against its own (`cfgdiff::Gate`), and the debug build
+// probe can diverge a file on purpose without touching a real installation.
+constexpr const char* kHarnessBuildId = "xray-monolith/harness";
+constexpr const char* kHarnessModId = "coop-harness";
+constexpr const char* kHarnessModVersion = "1";
+constexpr const char* kHarnessConfigFiles[] = {
+    "creatures.ltx", "items.ltx", "mod_load_order.ltx", "weapon_ammo.ltx", "zones.ltx",
+};
+
+// --- F1-13: the harness map profile ------------------------------------------
+//
+// Every harness session starts on the map the profile names (`XRN_HARNESS_LEVEL`,
+// `l01_escape` by default); the debug surface can move the whole group to the
+// second known map. Anything else is refused instead of guessed.
+constexpr lvl::InstanceId kStartInstance = 1;
+constexpr lvl::InstanceId kTargetInstance = 2;
+constexpr const char* kTargetLevel = "l02_darkvalley";
+
+bool is_probe_path(const std::string& path) {
+    if (path.empty() || path.size() > kMaxProbePathBytes) {
+        return false;
+    }
+    // A config path of the build manifest: relative, no traversal, printable.
+    if (path.front() == '/' || path.front() == '\\') {
+        return false;
+    }
+    return path.find("..") == std::string::npos && path.find('\\') == std::string::npos &&
+           path.find_first_of("\r\n\t") == std::string::npos;
+}
+
+// `a,b,c` -> ordered unique list of build paths (the debug surface treats its own
+// argument as untrusted: it reaches a manifest and an observation field).
+std::vector<std::string> split_probe_paths(const std::string& csv) {
+    std::vector<std::string> paths;
+    std::size_t start = 0;
+    while (start <= csv.size() && paths.size() < kMaxProbePaths) {
+        const std::size_t comma = csv.find(',', start);
+        std::string item =
+            csv.substr(start, comma == std::string::npos ? std::string::npos : comma - start);
+        const std::size_t first = item.find_first_not_of(" \t");
+        const std::size_t last = item.find_last_not_of(" \t");
+        item = first == std::string::npos ? std::string() : item.substr(first, last - first + 1);
+        if (is_probe_path(item) && std::find(paths.begin(), paths.end(), item) == paths.end()) {
+            paths.push_back(std::move(item));
+        }
+        if (comma == std::string::npos) {
+            break;
+        }
+        start = comma + 1;
+    }
+    return paths;
+}
+
+// The divergent list keeps the order the probe asked for (the player reads the
+// list that it triggered), but only paths the core really reported survive.
+std::vector<std::string> order_like(const std::vector<std::string>& requested,
+                                    const std::vector<std::string>& reported) {
+    std::vector<std::string> paths;
+    for (const std::string& path : requested) {
+        if (std::find(reported.begin(), reported.end(), path) != reported.end() &&
+            std::find(paths.begin(), paths.end(), path) == paths.end()) {
+            paths.push_back(path);
+        }
+    }
+    for (const std::string& path : reported) {
+        if (std::find(paths.begin(), paths.end(), path) == paths.end()) {
+            paths.push_back(path);
+        }
+    }
+    return paths;
+}
+
+cfg::CfgManifest harness_build() {
+    cfg::CfgManifest manifest;
+    manifest.build_id = kHarnessBuildId;
+    manifest.mods.push_back(cfg::CfgMod{kHarnessModId, kHarnessModVersion});
+    for (const char* path : kHarnessConfigFiles) {
+        cfg::CfgFile file;
+        file.path = path;
+        file.size = static_cast<std::uint32_t>(file.path.size());
+        file.digest = cfg::sha256(std::string("harness:") + file.path);
+        manifest.files.push_back(std::move(file));
+    }
+    // Canonical order + the build digest: exactly what `Gate::verify` compares.
+    cfg::finalize(manifest);
+    return manifest;
+}
+
+// A build whose listed files carry other bytes (a changed .ltx); a path the host
+// does not have at all is an extra file of the client. Both are divergences the
+// core reports by path.
+cfg::CfgManifest diverge_build(const cfg::CfgManifest& base,
+                               const std::vector<std::string>& paths) {
+    cfg::CfgManifest next = base;
+    for (const std::string& path : paths) {
+        bool known = false;
+        for (cfg::CfgFile& file : next.files) {
+            if (file.path != path) {
+                continue;
+            }
+            known = true;
+            file.size += 1;
+            file.digest = cfg::sha256(std::string("divergent:") + path);
+        }
+        if (!known) {
+            cfg::CfgFile extra;
+            extra.path = path;
+            extra.size = 1;
+            extra.digest = cfg::sha256(std::string("divergent:") + path);
+            next.files.push_back(std::move(extra));
+        }
+    }
+    cfg::finalize(next);
+    return next;
+}
+
+std::string level_for_instance(lvl::InstanceId instance, const std::string& start_level) {
+    return instance == kTargetInstance ? std::string(kTargetLevel) : start_level;
+}
+
+bool instance_for_level(const std::string& level, const std::string& start_level,
+                        lvl::InstanceId& out) {
+    if (level.empty()) {
+        return false;
+    }
+    if (level == kTargetLevel) {
+        out = kTargetInstance;
+        return true;
+    }
+    if (level == start_level) {
+        out = kStartInstance;
+        return true;
+    }
+    return false;
+}
 
 std::int64_t epoch_ms() {
     const auto since_epoch = std::chrono::system_clock::now().time_since_epoch();
@@ -150,6 +308,9 @@ struct CCoreRuntime::SImpl {
     std::string instance;
     std::string run_dir;
     std::string level = kDefaultLevel;
+    // The map this profile starts on (`XRN_HARNESS_LEVEL`); every instance other
+    // than the debug target map is this one (F1-13).
+    std::string start_level = kDefaultLevel;
     std::string error;
     // "xnt 0.1.0 (abi N) udp host 127.0.0.1:47000 - backends: ..." (F0-02).
     std::string transport;
@@ -184,6 +345,30 @@ struct CCoreRuntime::SImpl {
     bool view_ready = false;
     // Player id of this process' own character (host row / client slot).
     xrn::core::PlayerId local_player_id = kHostLocalPlayerId;
+
+    // --- F0-09 build identity ------------------------------------------------
+    // The manifest this process serves (host gate) or presents (client probe).
+    // Both are the same deterministic harness build, so a normal join passes and
+    // only an explicit debug divergence is refused.
+    cfg::CfgManifest build;
+    std::unique_ptr<cfg::Gate> cfg_gate;
+    std::unique_ptr<cfg::Probe> cfg_probe;
+    // The divergent paths the current debug probe asked for (event order + the
+    // manifest the client presents on its next join).
+    std::vector<std::string> probe_paths;
+    // True while a probe-triggered (re)join is in flight: the host's verdict is
+    // the answer of the check (`cfg_check` on success).
+    bool probe_pending = false;
+
+    // --- F1-13 group level change --------------------------------------------
+    // Host: the authoritative transition (wired into `HostConfig::level`, so the
+    // session ticks it and attributes peer intents).
+    std::unique_ptr<lvl::LevelChangeAuthority> level_authority;
+    // Client: the loading screen fed by the replicated journal.
+    lvl::LoadScreen level_screen;
+    bool level_screen_ready = false;
+    std::uint32_t level_ack_sequence = 0;
+    std::uint32_t level_event_sequence = 0;
 
     // --- engine bridge (F0-05) ----------------------------------------------
     // `coop::bridge()` (Lua) <-> core `BridgeLink` of the local session.
@@ -246,8 +431,20 @@ struct CCoreRuntime::SImpl {
         bool armed = false;
         PeerId peer = 0;
         xrn::core::PeerDrop mode = xrn::core::PeerDrop::KeepSlot;
+        // Wall clock of the drop; 0 = right after the verdict (see the callers).
+        std::int64_t due_ms = 0;
+        // The debug command that armed it (named in a failure observation).
+        const char* command = "debug.reconnect";
     };
     SPendingDrop pending_drop;
+    // Host: peers whose join the build gate refused. Their transport session still
+    // holds their address (the transport rekeys a peer only after its session
+    // closed), so the host closes it once the refusal verdict left (F0-09).
+    struct SRefusedPeer {
+        PeerId peer = 0;
+        std::int64_t due_ms = 0;
+    };
+    std::vector<SRefusedPeer> refused_peers;
     // Client: when to try starting a fresh transport session (F0-02 recovery).
     std::int64_t client_reconnect_at_ms = 0;
     // Client: the join verdict was already observed as an event (F0-09).
@@ -280,6 +477,23 @@ struct CCoreRuntime::SImpl {
             return &client_session->bridge();
         }
         return nullptr;
+    }
+
+    // The config of this process' client session. Built on every (re)connect, so
+    // a probe that swapped the build manifest is presented on the next join.
+    xrn::core::ClientConfig make_client_config() const {
+        xrn::core::ClientConfig config;
+        config.host_peer = kClientPeerId;
+        config.player_id = local_player_id;
+        config.player_name = instance;
+        config.log = log.get();
+        // F0-02 recovery: a lost link is not the end of the session (F1-10 decides).
+        config.host_loss_grace_ms = kClientReconnectGraceMs;
+        if (cfg_probe != nullptr) {
+            // F0-09: the manifest of this build travels with the join.
+            config.cfg_probe = cfg_probe.get();
+        }
+        return config;
     }
 
     void note_error(const std::string& text) {
@@ -333,6 +547,113 @@ struct CCoreRuntime::SImpl {
             return std::string();
         }
         return payload.substr(prefix.size());
+    }
+
+    // --- F1-13: level transitions -> observations + F0-07 log + Lua seam -----
+    //
+    // The host owns the transition: the authority queues its events (loading,
+    // spawned, refused) and they cross the seam like every other world event —
+    // once into the F0-07 log, once into the Lua channel and once into the bot
+    // channel, so a bot observes the same group move a script does.
+    void observe_level_events() {
+        if (level_authority == nullptr) {
+            return;
+        }
+        const std::vector<lvl::LevelEvent> events = level_authority->take_events();
+        if (events.empty()) {
+            return;
+        }
+        for (const lvl::LevelEvent& event : events) {
+            std::string payload;
+            if (failed(lvl::encode_level_event(event, payload))) {
+                continue;
+            }
+            if (log != nullptr) {
+                obs::Event log_event;
+                log_event.tick = world != nullptr ? world->tick() : 0;
+                log_event.kind = obs::EventKind::WorldMutation;
+                log_event.detail = "level " + payload;
+                log->push(std::move(log_event));
+            }
+            if (event.kind == lvl::LevelEventKind::Spawned) {
+                // The group stands in the target instance: the map of every actor
+                // (and of the host's own row) follows the world, never a counter.
+                level = level_for_instance(event.target, start_level);
+                channel.observe_event(
+                    "level_change",
+                    {{"level", bot::SJson::make_string(level)},
+                     {"instance", bot::SJson::make_number(static_cast<double>(event.target))},
+                     {"movers", bot::SJson::make_number(static_cast<double>(event.movers))}});
+            } else if (event.kind == lvl::LevelEventKind::Refused) {
+                channel.observe_event(
+                    "level_refused",
+                    {{"reason", bot::SJson::make_string(lvl::refusal_token(event.refusal))}});
+            }
+        }
+        if (host_session != nullptr) {
+            static_cast<void>(
+                lvl::publish_level_events(host_session->bridge(), events, level_event_sequence));
+        }
+    }
+
+    // What `command("debug.level_change")` acts for: the peer that sent the
+    // command (F0-02), the loopback player of an in-process check, or the host's
+    // own player when the host's bot asked.
+    rep::WriterSlot level_requester() const {
+        if (debug_requester != 0 && host_session != nullptr) {
+            const std::optional<rep::WriterSlot> slot = host_session->slot_of(debug_requester);
+            if (slot.has_value()) {
+                return slot.value();
+            }
+        }
+        if (peer_session != nullptr) {
+            return peer_session->writer_slot();
+        }
+        return rep::kHostWriter;
+    }
+
+    // The crash of the transition window (`crash=<instance>`): the peer that asked
+    // for it vanishes while the group loads, comes back and must exist exactly
+    // once, in the target map, with its inventory (AC-3.3.2). A player can only
+    // crash itself, never somebody else.
+    bool arm_peer_crash(const std::string& who, std::string& detail) {
+        if (who.empty()) {
+            return true;
+        }
+        if (peer_session != nullptr) {
+            // In-process profile: the loopback peer is this process' own client.
+            if (who != instance + "-bot") {
+                detail = "crash names another player: " + who;
+                return false;
+            }
+            reconnect_expired = false;
+            reconnect_phase = 1;
+            reconnect_at_ms = 0;
+            return true;
+        }
+        if (debug_requester == 0 || host_session == nullptr) {
+            detail = "a crash needs a connected peer";
+            return false;
+        }
+        for (const xrn::core::PeerInfo& peer : host_session->peers()) {
+            if (peer.peer != debug_requester) {
+                continue;
+            }
+            if (peer.player_name != who) {
+                detail = "crash names another player: " + who;
+                return false;
+            }
+            // The drop follows the verdict of the command (the peer still answers
+            // its bot action), and the slot stays reserved, so the return resumes
+            // the same character inside the window (F1-10).
+            pending_drop.armed = true;
+            pending_drop.peer = peer.peer;
+            pending_drop.mode = xrn::core::PeerDrop::KeepSlot;
+            pending_drop.due_ms = epoch_ms() + kDebugCfgDropDelayMs;
+            return true;
+        }
+        detail = "crash names a peer that is not in the session: " + who;
+        return false;
     }
 
     void observe_environment_event(const env::EnvironmentEvent& event) {
@@ -532,6 +853,93 @@ struct CCoreRuntime::SImpl {
         const std::vector<rep::EntityRecord> records = client_session->mirror().records();
         actor_view.refresh(records, local_player_id);
         item_view.refresh(records, local_player_id);
+        // F1-13: the journal travels in the same records, so the loading screen is
+        // refreshed from the same snapshot the view was built from.
+        level_screen.refresh(records, local_player_id);
+        level_screen_ready = true;
+    }
+
+    // --- F1-13: level of a character -----------------------------------------
+    //
+    // The level of a player is the map of the instance its character lives in
+    // (the transition rekeys the records, so a snapshot is enough — the level is
+    // never a replicated string that could disagree with the world).
+    std::string level_of_slot(rep::WriterSlot slot) const {
+        if (actors != nullptr) {
+            const std::optional<act::ActorView> view = actors->view(slot);
+            if (view.has_value()) {
+                return level_for_instance(view->key.instance, start_level);
+            }
+        }
+        return level;
+    }
+
+    // The character of this process' own player, once it is in the world.
+    std::optional<act::ActorView> local_actor_view() const {
+        if (host_session != nullptr && actors != nullptr) {
+            for (const xrn::core::SessionPlayer& player : host_session->players()) {
+                if (player.player_id != local_player_id ||
+                    player.state != xrn::core::PlayerState::Connected) {
+                    continue;
+                }
+                return actors->view(player.slot);
+            }
+            return std::nullopt;
+        }
+        if (client_session != nullptr) {
+            for (const act::ActorView& view : actor_view.all()) {
+                if (view.player_id == local_player_id) {
+                    return view;
+                }
+            }
+        }
+        return std::nullopt;
+    }
+
+    // Client: the level this process' own character is in. Before the character
+    // is in the mirror (still joining) the last known level stands.
+    std::string client_level() const {
+        const std::vector<act::ActorView>& views = actor_view.all();
+        for (const act::ActorView& view : views) {
+            if (view.player_id == local_player_id) {
+                return level_for_instance(view.key.instance, start_level);
+            }
+        }
+        if (!views.empty()) {
+            return level_for_instance(views.front().key.instance, start_level);
+        }
+        return level;
+    }
+
+    // --- F1-13: client loading screen + acknowledgement ----------------------
+    //
+    // The host commits once every mover acknowledged the token or the load budget
+    // expired (AC-3.3.3/AC-3.3.4). The ack is the real one of the protocol: a
+    // client says "the target map is up" through the same seam a script would.
+    void service_level_screen() {
+        if (client_session == nullptr) {
+            return;
+        }
+        // The journal and the characters arrive in the same records; the view
+        // refresh is sequence-gated, so this is a no-op while nothing changed.
+        refresh_client_view();
+        if (!level_screen_ready) {
+            return;
+        }
+        const std::uint32_t token = level_screen.pending_token();
+        if (token == lvl::kNoToken) {
+            return;
+        }
+        std::string payload;
+        if (failed(lvl::encode_level_ack(token, payload))) {
+            return;
+        }
+        BridgeMessage message;
+        message.seq = ++level_ack_sequence;
+        message.channel = lvl::kAckChannel;
+        message.payload = std::move(payload);
+        client_session->bridge().on_outbound(message);
+        level_screen.ack(token);
     }
 
     // --- F0-02 client recovery ----------------------------------------------
@@ -566,14 +974,112 @@ struct CCoreRuntime::SImpl {
             return;
         }
         rejection_seen = true;
+        probe_pending = false;
         const CoreError reason = client_session->join_rejection();
         if (reason == CoreError::BuildMismatch) {
-            channel.observe_event_files("join_rejected", client_session->rejection_paths(),
-                                        "cfg_diff");
+            // The paths come from the host's verdict (decoded by the core probe);
+            // only their order is the one the player asked for.
+            channel.observe_event_files(
+                "join_rejected", order_like(probe_paths, client_session->rejection_paths()),
+                "cfg_diff");
             return;
         }
         const std::string text = xrn::core::to_string(reason);
         channel.observe_event("join_rejected", {{"reason", bot::SJson::make_string(text)}});
+    }
+
+    // F0-09: the verdict of a probe-triggered join is the answer of the build
+    // check: an accepted join is exactly "the builds match" (AC-1.10.2).
+    void observe_client_join() {
+        if (!probe_pending || client_session == nullptr) {
+            return;
+        }
+        if (!client_session->join_accepted()) {
+            return;
+        }
+        probe_pending = false;
+        channel.observe_event("cfg_check", {{"result", bot::SJson::make_string("match")}});
+    }
+
+    // --- F0-09 debug build probe (client side) -------------------------------
+    //
+    // The build belongs to the client, so the probe is applied here: the manifest
+    // this process presents is swapped and the host decides at the join step
+    // (a divergent build never reaches the session, AC-1.10.1). Nothing is faked:
+    // the real `cfgdiff::Probe`/`Gate` pair does the comparison.
+    //
+    //   * the build matches and the session runs: the join already verified this
+    //     exact build, so the probe answers with `cfg_check` and moves nothing;
+    //   * the build diverges: the probe goes to the host as a normal debug intent,
+    //     which drops this peer so it re-joins with the build it now presents; the
+    //     host's verdict is the refusal, with the divergent paths;
+    //   * no session runs (a refused build): the player fixed it and connects
+    //     again — the probe is that reconnection.
+    enum class SProbeOutcome { Local, Forward, Failed };
+
+    SProbeOutcome probe_build(const std::string& argument, std::string& detail) {
+        detail.clear();
+        const std::vector<std::string> paths =
+            split_probe_paths(argument_value(argument, "mismatch"));
+        probe_paths = paths;
+        const cfg::CfgManifest next = paths.empty() ? build : diverge_build(build, paths);
+        const bool diverges = !cfg::compare(build, next).accepted();
+        if (cfg_probe != nullptr) {
+            cfg_probe->update_manifest(next);
+        }
+        const bool live = client_session != nullptr && !client_session->session_ended() &&
+                          client_session->join_accepted();
+        if (!diverges) {
+            if (live) {
+                // The host accepted this very build at the join (F0-09), so the
+                // check is a confirmation and nothing is refused.
+                channel.observe_event("cfg_check",
+                                      {{"result", bot::SJson::make_string("match")}});
+                detail = "builds match";
+                return SProbeOutcome::Local;
+            }
+            if (!restart_client_session()) {
+                detail = "no transport to re-check the build";
+                return SProbeOutcome::Failed;
+            }
+            probe_pending = true;
+            detail = "re-checking the current build at the join";
+            return SProbeOutcome::Local;
+        }
+        if (cfg_probe == nullptr) {
+            detail = "this profile does not verify builds";
+            return SProbeOutcome::Failed;
+        }
+        if (live) {
+            // Divergent build and a running session: the host refuses it and drops
+            // this peer for the real re-check (see `command("debug.cfg_probe")`).
+            detail = "divergent build sent to the host";
+            return SProbeOutcome::Forward;
+        }
+        if (!restart_client_session()) {
+            detail = "no transport to re-check the build";
+            return SProbeOutcome::Failed;
+        }
+        probe_pending = true;
+        detail = "divergent build re-checked at the join";
+        return SProbeOutcome::Local;
+    }
+
+    // F0-08: a refused join ends the client session (the player is out). The debug
+    // surface is the player fixing the build and connecting again: a fresh session
+    // on the same identity, so the host decides afresh (F1-10 governs the slot).
+    bool restart_client_session() {
+        if (endpoint == nullptr || link == nullptr) {
+            return false;
+        }
+        client_session.reset();
+        rejection_seen = false;
+        view_ready = false;
+        view_sequence = 0;
+        level_screen.clear();
+        level_screen_ready = false;
+        client_session.reset(new ClientSession(*link, make_client_config()));
+        return endpoint->reconnect_client();
     }
 
     // --- debug surface over the network (F0-02) ------------------------------
@@ -635,7 +1141,9 @@ struct CCoreRuntime::SImpl {
             ack.channel = kDebugAckChannel;
             ack.payload = std::string(accepted ? "done" : "failed") + kDebugFieldSeparator + detail;
             static_cast<void>(host_session->broadcast_bridge(ack));
-            apply_pending_drop();
+            // A drop the command asked for is applied after its verdict left, but
+            // never earlier than the command's own due time (see SPendingDrop).
+            apply_pending_drop(epoch_ms());
         }
         for (BridgeMessage& kept : foreign) {
             coop::bridge().enqueue(xrn::core::to_engine<coop::SMessage>(std::move(kept)));
@@ -644,9 +1152,12 @@ struct CCoreRuntime::SImpl {
 
     // The verdict is already on the wire, so the peer can answer its bot action
     // even though the host closes its link right after (F0-02).
-    void apply_pending_drop() {
+    void apply_pending_drop(std::int64_t now) {
         if (!pending_drop.armed) {
             return;
+        }
+        if (now < pending_drop.due_ms) {
+            return;  // still on the wire: the peer answers its action first
         }
         const SPendingDrop drop = pending_drop;
         pending_drop = SPendingDrop{};
@@ -655,13 +1166,57 @@ struct CCoreRuntime::SImpl {
         }
         const CoreError result = host_session->drop_peer(drop.peer, drop.mode);
         if (failed(result)) {
-            note_error(std::string("debug.reconnect: cannot drop the peer: ") +
+            note_error(std::string("debug drop: cannot drop the peer: ") +
                        xrn::core::to_string(result));
             channel.observe_event(
                 "debug_unsupported",
-                {{"command", bot::SJson::make_string("debug.reconnect")},
+                {{"command", bot::SJson::make_string(drop.command)},
                  {"reason", bot::SJson::make_string(std::string("drop failed: ") +
                                                     xrn::core::to_string(result))}});
+        }
+    }
+
+    // F0-09: a peer whose build the gate refused is not in the session, but its
+    // transport session still holds its address — and the transport rekeys a peer
+    // only after that session closed. The host closes it once the refusal verdict
+    // left, so the player can fix the build and connect again right away instead
+    // of waiting out the transport timeout (AC-1.10.3).
+    void close_refused_peers(std::int64_t now) {
+        if (host_session == nullptr || link == nullptr) {
+            refused_peers.clear();
+            return;
+        }
+        const std::vector<xrn::core::PeerInfo> peers = host_session->peers();
+        for (const xrn::core::PeerInfo& peer : peers) {
+            if (peer.handshake_ok || peer.ended ||
+                peer.join_rejection != CoreError::BuildMismatch) {
+                continue;
+            }
+            bool known = false;
+            for (const SRefusedPeer& entry : refused_peers) {
+                known = known || entry.peer == peer.peer;
+            }
+            if (!known) {
+                refused_peers.push_back(
+                    SRefusedPeer{peer.peer, now + kDebugCfgDropDelayMs * 2});
+            }
+        }
+        for (std::size_t index = 0; index < refused_peers.size();) {
+            const SRefusedPeer entry = refused_peers[index];
+            bool present = false;
+            for (const xrn::core::PeerInfo& peer : peers) {
+                present = present || (peer.peer == entry.peer && !peer.ended);
+            }
+            if (!present) {
+                refused_peers.erase(refused_peers.begin() + static_cast<std::ptrdiff_t>(index));
+                continue;
+            }
+            if (now < entry.due_ms) {
+                ++index;
+                continue;
+            }
+            static_cast<void>(link->disconnect(entry.peer));
+            refused_peers.erase(refused_peers.begin() + static_cast<std::ptrdiff_t>(index));
         }
     }
 
@@ -708,6 +1263,30 @@ struct CCoreRuntime::SImpl {
             if (name.empty()) {
                 answer(message, "failed", started, "empty command");
                 return;
+            }
+            if (!host && name == "debug.cfg_probe") {
+                // F0-09: the build probe belongs to the side that owns the build,
+                // so the client applies it and the host decides at the join step.
+                // Only a divergent build of a running session travels as an intent
+                // (below): the host refuses it and drops this peer for the real
+                // re-check, which is what the client then observes.
+                const SProbeOutcome outcome = probe_build(argument, detail);
+                if (outcome == SProbeOutcome::Failed) {
+                    channel.observe_event(
+                        "debug_unsupported",
+                        {{"command", bot::SJson::make_string(name)},
+                         {"reason", bot::SJson::make_string(detail)}});
+                    answer(message, "done", started);
+                    return;
+                }
+                if (outcome == SProbeOutcome::Local) {
+                    channel.observe_event(
+                        "debug_command", {{"command", bot::SJson::make_string(name)},
+                                          {"detail", bot::SJson::make_string(detail)}});
+                    answer(message, "done", started);
+                    return;
+                }
+                // Forward: the shared intent path answers when the host decided.
             }
             if (!host) {
                 // F0-02: a debug command is a host-side mechanic. A client sends
@@ -946,7 +1525,28 @@ struct CCoreRuntime::SImpl {
     bot::SObservedState observe_state() {
         bot::SObservedState state;
         state.actor.name = instance;
+
+        // F1-13: a client's map follows the instance of its own character (the
+        // group move rekeys the replicated actor records).
+        if (client_session != nullptr) {
+            refresh_client_view();
+            const std::string current = client_level();
+            if (current != level) {
+                level = current;
+                channel.observe_event("level_change",
+                                      {{"level", bot::SJson::make_string(level)}});
+            }
+        }
         state.actor.level = level;
+        // This process' own character: its real position, never a default. A client
+        // that sees itself somewhere else than the host sees it is a desync, and
+        // the F0-14 state comparison would (rightly) report it.
+        const std::optional<act::ActorView> own = local_actor_view();
+        if (own.has_value()) {
+            state.actor.x = own->position.x;
+            state.actor.y = own->position.y;
+            state.actor.z = own->position.z;
+        }
 
         if (host_session != nullptr) {
             const std::vector<xrn::core::SessionPlayer> players = host_session->players();
@@ -957,9 +1557,14 @@ struct CCoreRuntime::SImpl {
                 bot::SActorState row;
                 row.name =
                     player.name.empty() ? ("slot-" + std::to_string(player.slot)) : player.name;
-                row.level = level;
+                // F1-13: the map of a player is the instance its character is in.
+                row.level = level_of_slot(player.slot);
                 if (actors != nullptr) {
-                    const act::Vec3 position = actors->spawn_position(player.slot);
+                    // The replicated position of the character (the entry fan-out is
+                    // only its first value: a resume keeps the confirmed one).
+                    const std::optional<act::ActorView> view = actors->view(player.slot);
+                    const act::Vec3 position =
+                        view.has_value() ? view->position : actors->spawn_position(player.slot);
                     row.x = position.x;
                     row.y = position.y;
                     row.z = position.z;
@@ -990,7 +1595,7 @@ struct CCoreRuntime::SImpl {
             for (const act::ActorView& view : actor_view.all()) {
                 bot::SActorState row;
                 row.name = view.name.empty() ? ("slot-" + std::to_string(view.slot)) : view.name;
-                row.level = level;
+                row.level = level_for_instance(view.key.instance, start_level);
                 row.x = view.position.x;
                 row.y = view.position.y;
                 row.z = view.position.z;
@@ -1099,6 +1704,7 @@ bool CCoreRuntime::start() {
     if (!level.empty()) {
         impl.level = level;
     }
+    impl.start_level = impl.level;
     if (impl.run_dir.empty() || impl.instance.empty() ||
         (impl.role != "host" && impl.role != "client")) {
         // A normal game process: nothing to wire, nothing to log about.
@@ -1152,15 +1758,58 @@ bool CCoreRuntime::start() {
                 impl.inventory->spawn_item(kDebugItem, 1, entry->position).value_or(0);
         }
 
+        // F1-13: the host owns the group transition (F1-13). The catalog holds the
+        // map the profile starts on and the debug target map; one doorway stands on
+        // the start map at the point every player spawns on, so the whole group is
+        // at the changer (EC-7). The load budget is short: a debug run does not
+        // load a real map, a straggler resyncs into the committed state.
+        lvl::LevelConfig level_config;
+        level_config.load_timeout_ms = kDebugLoadBudgetMs;
+        // The debug surface is not a fight: EC-6 stays off for the scenario (a real
+        // session feeds the combat state of its own model, F1-08).
+        level_config.block_in_combat = false;
+        impl.level_authority.reset(
+            new lvl::LevelChangeAuthority(*impl.world, *impl.actors, level_config));
+        lvl::LevelInfo start;
+        start.instance = kStartInstance;
+        start.level = impl.start_level;
+        start.entry = entry.has_value() ? entry.value() : act::SpawnPoint{};
+        start.entry.instance = kStartInstance;
+        static_cast<void>(impl.level_authority->catalog().set(start));
+        lvl::LevelInfo target;
+        target.instance = kTargetInstance;
+        target.level = kTargetLevel;
+        target.entry = start.entry;
+        target.entry.instance = kTargetInstance;
+        static_cast<void>(impl.level_authority->catalog().set(target));
+        static_cast<void>(impl.level_authority->publish_idle());
+        lvl::LevelChanger changer;
+        changer.id = lvl::kChangerEntityBase;
+        changer.instance = kStartInstance;
+        changer.target = kTargetInstance;
+        changer.position = start.entry.position;
+        static_cast<void>(lvl::publish_changer(*impl.world, changer));
+
         if (wired) {
             xrn::core::HostConfig config;
             config.log = impl.log.get();
             config.actors = impl.actors.get();
             config.inventory = impl.inventory.get();
             config.environment = impl.environment.get();
+            // F1-13: the session ticks the transition and attributes peer intents.
+            config.level = impl.level_authority.get();
             config.host_name = impl.instance;
             config.hash_every_publishes = 5;
             config.reconnect.window_ms = kDebugReconnectWindowMs;
+            if (impl.udp) {
+                // F0-09: every join of a harness client carries the build it runs
+                // and this host compares it against its own (AC-1.10.1). The
+                // in-process profile keeps the pre-F0-09 behaviour: its loopback
+                // peer is a local check, not a joining player.
+                impl.build = harness_build();
+                impl.cfg_gate.reset(new cfg::Gate(impl.build));
+                config.cfg_gate = impl.cfg_gate.get();
+            }
             if (impl.net != nullptr) {
                 // In-process profile: the endpoint is owned by the network object.
                 impl.link = impl.net->endpoint(kHostPeerId).release();
@@ -1177,24 +1826,23 @@ bool CCoreRuntime::start() {
             }
         }
     } else if (wired) {
-        xrn::core::ClientConfig config;
-        config.host_peer = kClientPeerId;
-        config.player_id = env_uint("XRN_HARNESS_SLOT", 1) + 1;
-        config.player_name = impl.instance;
-        config.log = impl.log.get();
+        // F0-09: the build this process presents at the join, verified by the host.
+        impl.local_player_id = env_uint("XRN_HARNESS_SLOT", 1) + 1;
+        if (impl.udp) {
+            impl.build = harness_build();
+            impl.cfg_probe.reset(new cfg::Probe(impl.build));
+        }
         // F0-02 recovery: a lost link is not the end of the session. The adapter
         // restarts the transport session and rejoins with the same identity while
         // the host's reconnect window still holds the slot (F1-10) — so a peer the
         // host dropped comes back as the same character, or learns that its window
         // expired. Outside the grace window the session ends like a listen host
         // without a host (EC-4).
-        config.host_loss_grace_ms = kClientReconnectGraceMs;
-        impl.local_player_id = config.player_id;
         if (impl.net != nullptr) {
             impl.link = impl.net->endpoint(kClientPeerId).release();
             impl.owned_link.reset(impl.link);
         }
-        impl.client_session.reset(new ClientSession(*impl.link, config));
+        impl.client_session.reset(new ClientSession(*impl.link, impl.make_client_config()));
     }
 
     // F0-05: the core becomes the sink of the engine Lua bridge.
@@ -1248,6 +1896,9 @@ void CCoreRuntime::shutdown() {
     impl.owned_link.reset();
     impl.endpoint.reset();
     impl.net.reset();
+    impl.level_authority.reset();
+    impl.cfg_gate.reset();
+    impl.cfg_probe.reset();
     impl.inventory.reset();
     impl.actors.reset();
     impl.environment.reset();
@@ -1318,15 +1969,31 @@ void CCoreRuntime::tick() {
                 if (!events.empty()) {
                     impl.publish_environment_events(events);
                 }
+                // F1-01: the world holds exactly one character per connected player.
+                // The host's own character is part of it, so a client observes the
+                // host and a group transition moves it with everybody (AC-3.3.1).
+                if (impl.actors != nullptr) {
+                    static_cast<void>(impl.actors->sync(impl.host_session->players()));
+                }
                 impl.host_session->publish();
+                // F1-13: `publish()` ticks the level authority, so a committed
+                // group move is observed in the same step it happened.
+                impl.observe_level_events();
             }
             impl.observe_item_events();
             impl.observe_session_deltas();
             impl.step_reconnect_cycle(now);
+            // A debug drop that had to let a verdict out first (F0-02/F0-09).
+            impl.apply_pending_drop(now);
+            // A refused build keeps the address of its transport session: close it
+            // once the verdict left, so the player can connect again at once.
+            impl.close_refused_peers(now);
         } else if (impl.client_session != nullptr) {
             impl.client_session->service();
             impl.observe_client_rejection();
+            impl.observe_client_join();
             impl.service_client_link(now);
+            impl.service_level_screen();
         }
     }
 
@@ -1432,8 +2099,102 @@ bool CCoreRuntime::command(const std::string& name, const std::string& argument,
         impl.pending_drop.peer = impl.debug_requester;
         impl.pending_drop.mode =
             expired ? xrn::core::PeerDrop::CloseWindow : xrn::core::PeerDrop::KeepSlot;
+        impl.pending_drop.due_ms = epoch_ms() + kDebugCfgDropDelayMs;
+        impl.pending_drop.command = "debug.reconnect";
         detail =
             expired ? "peer drops, window closes, peer returns" : "peer returns inside the window";
+        return true;
+    }
+    if (name == "debug.cfg_probe") {
+        // F0-09 (AC-1.10): the build comparison of a debug run. The host serves
+        // its manifest, the client presents its own at the join; the probe either
+        // confirms the current build (`cfg_check`) or makes the host refuse the
+        // divergent one — the peer is dropped and re-joins with the build it now
+        // presents, so the refusal the client sees is a real join verdict with the
+        // real divergent paths (never a simulated one).
+        if (!impl.host) {
+            detail = "the build check is host-authoritative";
+            return false;
+        }
+        const std::vector<std::string> paths =
+            split_probe_paths(argument_value(argument, "mismatch"));
+        if (paths.empty()) {
+            // Identical builds pass without a refusal and without a move (AC-1.10.2).
+            impl.channel.observe_event("cfg_check",
+                                       {{"result", bot::SJson::make_string("match")}});
+            detail = "builds match";
+            return true;
+        }
+        if (impl.cfg_gate == nullptr || impl.host_session == nullptr ||
+            impl.debug_requester == 0) {
+            detail = "a divergent build needs a connected peer to re-check";
+            return false;
+        }
+        const cfg::CfgManifest divergent = diverge_build(impl.cfg_gate->manifest(), paths);
+        const cfg::CfgDiff diff = cfg::compare(impl.cfg_gate->manifest(), divergent);
+        if (diff.accepted()) {
+            detail = "the requested files do not diverge from this build";
+            return false;
+        }
+        const std::vector<std::string> files = order_like(paths, diff.paths());
+        impl.channel.observe_event_files("join_rejected", files, "cfg_diff");
+        // The peer is dropped *after* its verdict, keeps its slot (the reconnect
+        // window of F1-10) and comes back with the divergent build it now
+        // presents: the gate answers with the paths and the client records the
+        // refusal (AC-1.10.1, the list only the refused player needs).
+        impl.pending_drop.armed = true;
+        impl.pending_drop.peer = impl.debug_requester;
+        impl.pending_drop.mode = xrn::core::PeerDrop::KeepSlot;
+        impl.pending_drop.due_ms = epoch_ms() + kDebugCfgDropDelayMs;
+        impl.pending_drop.command = "debug.cfg_probe";
+        detail = std::to_string(files.size()) + " divergent file(s): the build is refused";
+        return true;
+    }
+    if (name == "debug.level_change") {
+        // F1-13 (AC-3.3): a group move through a level changer. The authority
+        // validates the request in the sender's slot and the session commits it in
+        // `publish()` once the movers acknowledged the token or the load budget
+        // expired; the observations of what happened come from its events.
+        if (!impl.host || impl.level_authority == nullptr || impl.host_session == nullptr) {
+            detail = "a level change is host-authoritative";
+            return false;
+        }
+        const std::string requested = argument_value(argument, "level");
+        lvl::InstanceId target = 0;
+        if (!instance_for_level(requested, impl.start_level, target)) {
+            detail = requested.empty() ? "debug.level_change needs level=<map>"
+                                       : "unknown level: " + requested;
+            return false;
+        }
+        // A crash of the transition window is the peer's own: the named player must
+        // be the sender, and the drop keeps its slot so the return resumes the same
+        // character (AC-3.3.2 — one location, same inventory).
+        std::string failure;
+        if (!impl.arm_peer_crash(argument_value(argument, "crash"), failure)) {
+            detail = failure;
+            return false;
+        }
+        const lvl::TransitionView current = impl.level_authority->transition();
+        if (current.state == lvl::State::Completed && current.target == target) {
+            // A repeated debug step: the group already stands in the target map.
+            detail = "group already in " + requested;
+            return true;
+        }
+        lvl::LevelChangeIntent intent;
+        intent.request = ++impl.next_request;
+        intent.changer = lvl::kChangerEntityBase;
+        const lvl::LevelChangeVerdict verdict =
+            impl.level_authority->request(impl.level_requester(), intent, epoch_ms());
+        if (!verdict.accepted()) {
+            if (verdict.refusal != lvl::Refusal::AlreadyThere) {
+                detail = std::string("level change refused: ") + lvl::refusal_token(verdict.refusal);
+                return false;
+            }
+            detail = "group already in " + requested;
+            return true;
+        }
+        detail = "group moves to " + requested + " (" + std::to_string(verdict.movers) +
+                 " mover(s))";
         return true;
     }
     detail = "unknown debug command";
