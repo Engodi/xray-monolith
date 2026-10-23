@@ -13,6 +13,10 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 root="$(cd "$here/../../.." && pwd)"
 coop_dir="$root/src/xrGame/coop"
 
+# MSVC-only regressions of the Lua export (see check_msvc_compat.py): the host
+# compiler cannot see them, the Windows build can.
+python3 "$here/check_msvc_compat.py"
+
 for file in coop_bot_json.cpp coop_bot_channel.cpp coop_bot_json.h coop_bot_channel.h; do
     if [[ ! -f "$coop_dir/$file" ]]; then
         echo "missing $coop_dir/$file" >&2

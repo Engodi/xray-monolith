@@ -24,6 +24,11 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 root="$(cd "$here/../../.." && pwd)"
 coop="${COOP_SOURCE_ROOT:-$root/../coop}"
 
+# MSVC-only regressions of the Lua export (a `luabind::error` catch outside the
+# exceptions guard, a wrapper shadowed by the Lua C API) compile fine on the
+# host and only fail in the Windows build, so they are checked statically.
+python3 "$here/check_msvc_compat.py"
+
 if [[ ! -d "$coop/src/core/include/xrn/core" ]]; then
     echo "coop checkout not found at $coop (set COOP_SOURCE_ROOT)" >&2
     echo "skip: run.sh покрывает движковые модули, run_core.sh требует ядро" >&2

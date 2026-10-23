@@ -103,12 +103,21 @@ void lua_enable_dispatch() {
             return;
         }
 
+        // The engine's release build is compiled without C++ exceptions, which
+        // `xrCore.h` expresses as `LUABIND_NO_EXCEPTIONS`: `luabind::error` does
+        // not exist there and a failing call is reported by the pcall callback
+        // (`CScriptEngine::lua_pcall_failed`) instead of being thrown. Same
+        // convention as `process_error` in `script_callback_ex.h`.
+#ifndef LUABIND_NO_EXCEPTIONS
         try {
             handler(message.channel.c_str(), message.payload.c_str(), message.seq);
         } catch (::luabind::error& error) {
             if (error.state())
                 ai().script_engine().print_output(error.state(), "", LUA_ERRRUN);
         }
+#else   // LUABIND_NO_EXCEPTIONS
+        handler(message.channel.c_str(), message.payload.c_str(), message.seq);
+#endif  // LUABIND_NO_EXCEPTIONS
     });
 }
 

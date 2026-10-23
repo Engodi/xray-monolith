@@ -5,6 +5,7 @@
 
 | Скрипт | Что проверяет | Зависимости |
 |---|---|---|
+| `check_msvc_compat.py` | MSVC-совместимость Lua-экспорта по настоящим заголовкам движка: `luabind::error` только под `#ifndef LUABIND_NO_EXCEPTIONS` (release собирается без исключений), обёртка не перекрывается именем из Lua C API (`&lua_status` → неразрешённый overload set). Гоняется из `run.sh` и `run_core.sh` | python3 |
 | `run.sh` | JSON и файловый канал ботов (`coop_bot_json`, `coop_bot_channel`): порядок/`seq`/`token`, ack, поток наблюдений, `join_rejected` с путями | g++ (C++17) |
 | `run_core.sh` | 1) весь адаптер (`coop_core_runtime`) против **реального** ядра в in-process профиле: тик, события среды, debug-команды, вердикт `HostSession` для интента бота, `<instance>.jsonl` (валидируется `obs::read_jsonl`) и метрики; 2) **два процесса по реальному UDP** (loopback): join, снапшот, интент подбора и ack, debug-интент клиента → вердикт хоста по сети, наблюдения клиента из зеркала | g++/clang++ + чекаут `coop` (`COOP_SOURCE_ROOT`) |
 

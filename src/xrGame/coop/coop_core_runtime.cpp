@@ -621,14 +621,14 @@ struct CCoreRuntime::SImpl {
             const bool accepted = coop::core_runtime().command(name, argument, detail);
             debug_requester = 0;
             if (accepted) {
-                channel.observe_event("debug_command", {{"command", bot::SJson::make_string(name)},
-                                                        {"detail", bot::SJson::make_string(detail)}});
+                channel.observe_event("debug_command",
+                                      {{"command", bot::SJson::make_string(name)},
+                                       {"detail", bot::SJson::make_string(detail)}});
             } else {
                 // Honest answer: the surface exists, the mechanic is not wired.
-                channel.observe_event(
-                    "debug_unsupported",
-                    {{"command", bot::SJson::make_string(name)},
-                     {"reason", bot::SJson::make_string(detail)}});
+                channel.observe_event("debug_unsupported",
+                                      {{"command", bot::SJson::make_string(name)},
+                                       {"reason", bot::SJson::make_string(detail)}});
             }
             BridgeMessage ack;
             ack.seq = message.seq;
@@ -782,8 +782,9 @@ struct CCoreRuntime::SImpl {
                 } else {
                     channel.observe_event(
                         "pickup_rejected",
-                        {{"item", bot::SJson::make_string(verdict.item_class.empty() ? action.item
-                                                                                     : verdict.item_class)},
+                        {{"item",
+                          bot::SJson::make_string(verdict.item_class.empty() ? action.item
+                                                                             : verdict.item_class)},
                          {"reason", bot::SJson::make_string(inv::to_string(verdict.status))}});
                 }
                 answer(message, "done", started);
@@ -1209,8 +1210,8 @@ bool CCoreRuntime::start() {
     }
 
     if (impl.log != nullptr) {
-        const std::string detail = std::string(impl.host ? "headless host, " : "headless client, ") +
-                                   impl.transport;
+        const std::string detail =
+            std::string(impl.host ? "headless host, " : "headless client, ") + impl.transport;
         impl.log->session_start(0, detail);
     }
 
@@ -1273,11 +1274,18 @@ void CCoreRuntime::tick() {
         impl.lua_started = true;
         ::luabind::functor<void> bootstrap;
         if (ai().script_engine().functor("coop_core.on_game_start", bootstrap)) {
+            // release builds are compiled without exceptions (`xrCore.h`:
+            // `LUABIND_NO_EXCEPTIONS`), so `luabind::error` does not exist and
+            // the pcall callback reports a failing call instead of throwing.
+#ifndef LUABIND_NO_EXCEPTIONS
             try {
                 bootstrap();
             } catch (const ::luabind::error&) {
                 impl.note_error("Lua bootstrap failed (coop_core.on_game_start)");
             }
+#else   // LUABIND_NO_EXCEPTIONS
+            bootstrap();
+#endif  // LUABIND_NO_EXCEPTIONS
         }
     }
 
@@ -1424,8 +1432,8 @@ bool CCoreRuntime::command(const std::string& name, const std::string& argument,
         impl.pending_drop.peer = impl.debug_requester;
         impl.pending_drop.mode =
             expired ? xrn::core::PeerDrop::CloseWindow : xrn::core::PeerDrop::KeepSlot;
-        detail = expired ? "peer drops, window closes, peer returns"
-                         : "peer returns inside the window";
+        detail =
+            expired ? "peer drops, window closes, peer returns" : "peer returns inside the window";
         return true;
     }
     detail = "unknown debug command";
