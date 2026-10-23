@@ -13,7 +13,8 @@
 //	    `xrn_core_runlog merge` / `testrun.sh diff`);
 //	  * core events -> engine Lua bridge (`coop.sync`/`coop.events` channels,
 //	    F0-05) so the gameplay layer sees the same world events as the
-//	    observability artifact;
+//	    observability artifact; the same event stream is broadcast to every
+//	    client, so a client bot observes what the host publishes (F0-12);
 //	  * bot action channel (F0-12): `<run-dir>/<instance>/bot/inbox` intents are
 //	    resolved by the host session and answered in `outbox` + observations.
 //

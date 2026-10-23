@@ -93,10 +93,16 @@ public:
     // the session that owns the link is gone.
     void stop();
 
+    // Client only: starts a fresh transport session after the previous one was
+    // lost (the host dropped this peer or went away). Same socket, same server;
+    // the link reports Connected again when the handshake completes. False when
+    // this endpoint is not a client or the transport refused (see error()).
+    bool reconnect_client();
+
     [[nodiscard]] bool running() const noexcept;
     [[nodiscard]] xrn::core::IMessageLink* link() const noexcept;
     [[nodiscard]] const std::string& error() const noexcept;
-    // "xnt 0.1.0 (abi 1) udp host 127.0.0.1:47000 - backends: ..." for the log and
+    // "xnt 0.1.0 (abi N) udp host 127.0.0.1:47000 - backends: ..." for the log and
     // the debug surface. Empty until a successful start().
     [[nodiscard]] const std::string& description() const noexcept;
     // Host: the port actually bound. Client: the port it connects to.

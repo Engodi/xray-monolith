@@ -82,6 +82,18 @@ constexpr xrn::core::PlayerId kHostLocalPlayerId = xrn::core::kHostPlayerId;
 constexpr const char* kDebugIntentChannel = "coop.debug.intent";
 constexpr const char* kDebugAckChannel = "coop.debug.ack";
 constexpr char kDebugFieldSeparator = '\n';
+// Host -> clients: the session events the host observes for its own bot channel
+// (F0-12) travel to every client on this channel, so a client bot sees the same
+// events as the host (`observer = peer` over the network). Payload: `event=<name>`.
+constexpr const char* kObsEventChannel = "coop.obs.event";
+constexpr const char* kObsEventField = "event=";
+// F0-02 client recovery: a lost link is re-established on the same identity, and
+// the host's reconnect window (F1-10) decides what happens. The client keeps the
+// session open for one window longer than the host reserves the slot, so a
+// "window expired" answer still arrives instead of the client giving up first.
+constexpr std::uint32_t kClientReconnectGraceMs = kDebugReconnectWindowMs * 2;
+// A fresh transport session takes a handshake; never restart it faster.
+constexpr std::uint32_t kClientReconnectRetryMs = 50;
 constexpr const char* kDefaultLevel = "l01_escape";
 constexpr const char* kDebugItem = "bread";
 
@@ -139,7 +151,7 @@ struct CCoreRuntime::SImpl {
     std::string run_dir;
     std::string level = kDefaultLevel;
     std::string error;
-    // "xnt 0.1.0 (abi 1) udp host 127.0.0.1:47000 - backends: ..." (F0-02).
+    // "xnt 0.1.0 (abi N) udp host 127.0.0.1:47000 - backends: ..." (F0-02).
     std::string transport;
 
     // --- core ----------------------------------------------------------------
@@ -225,6 +237,24 @@ struct CCoreRuntime::SImpl {
     bool reconnect_expired = false;
     std::int64_t reconnect_at_ms = 0;
 
+    // F0-02: the debug command arrived from this transport peer (0 = local, the
+    // host's own bot/Lua). A network drop is applied to exactly this peer.
+    PeerId debug_requester = 0;
+    // Host: the drop the current debug command asked for. It is applied *after*
+    // the verdict left, so the client still answers its bot action.
+    struct SPendingDrop {
+        bool armed = false;
+        PeerId peer = 0;
+        xrn::core::PeerDrop mode = xrn::core::PeerDrop::KeepSlot;
+    };
+    SPendingDrop pending_drop;
+    // Client: when to try starting a fresh transport session (F0-02 recovery).
+    std::int64_t client_reconnect_at_ms = 0;
+    // Client: the join verdict was already observed as an event (F0-09).
+    bool rejection_seen = false;
+    // Host -> clients observation stream sequence (F0-12).
+    std::uint32_t obs_sequence = 0;
+
     // Authoritative counters: the derived observations of AC-1.12/AC-1.10 are
     // read from them, never from the adapter's own guesses.
     std::uint64_t seen_reclaims = 0;
@@ -259,6 +289,52 @@ struct CCoreRuntime::SImpl {
     }
 
     // --- environment events -> observations + F0-07 log ---------------------
+    //
+    // F0-05 + F0-02: this is the host's single world-event stream. It reaches the
+    // host's Lua layer (core -> Lua) and every client (bridge broadcast); a client
+    // decodes the same canonical payload instead of reconstructing the event from
+    // a snapshot diff, so counts and order match the host's stream exactly.
+    void publish_environment_events(const std::vector<env::EnvironmentEvent>& events) {
+        if (host_session == nullptr) {
+            return;
+        }
+        for (const env::EnvironmentEvent& event : events) {
+            std::string payload;
+            if (failed(env::encode_environment_event(event, payload))) {
+                continue;
+            }
+            BridgeMessage message;
+            message.seq = ++env_sequence;
+            message.channel = env::kBridgeChannel;
+            message.payload = std::move(payload);
+            static_cast<void>(host_session->bridge().push_inbound(message));
+            static_cast<void>(host_session->broadcast_bridge(message));
+        }
+    }
+
+    // Host: a session event its own bot observes is a world event for the
+    // clients too (F1-10/F0-12) — the rejoin of a peer, the end of a window.
+    void observe_session_event(const std::string& name) {
+        channel.observe_event(name, {});
+        if (host_session == nullptr) {
+            return;
+        }
+        BridgeMessage message;
+        message.seq = ++obs_sequence;
+        message.channel = kObsEventChannel;
+        message.payload = std::string(kObsEventField) + name;
+        static_cast<void>(host_session->broadcast_bridge(message));
+    }
+
+    // Client: parse the host's observation event (`event=<name>`).
+    static std::string obs_event_name(const std::string& payload) {
+        const std::string prefix = kObsEventField;
+        if (payload.rfind(prefix, 0) != 0) {
+            return std::string();
+        }
+        return payload.substr(prefix.size());
+    }
+
     void observe_environment_event(const env::EnvironmentEvent& event) {
         std::string payload;
         if (failed(env::encode_environment_event(event, payload))) {
@@ -266,7 +342,12 @@ struct CCoreRuntime::SImpl {
         }
 
         obs::Event log_event;
-        log_event.tick = world != nullptr ? world->tick() : 0;
+        // The tick of the event: authoritative on the host, the last applied
+        // authoritative tick on a client. Both processes then merge onto one
+        // timeline (F0-14) instead of one side logging under tick 0.
+        log_event.tick = host_session != nullptr
+                             ? (world != nullptr ? world->tick() : 0)
+                             : (client_session != nullptr ? client_session->mirror().tick() : 0);
         log_event.detail = payload;
 
         switch (event.kind) {
@@ -278,11 +359,19 @@ struct CCoreRuntime::SImpl {
             break;
         case env::EnvironmentEventKind::Emission:
             log_event.kind = obs::EventKind::Emission;
-            // The start of the cycle is what the scenarios observe once.
+            // The start of the cycle and its end are the two boundaries every
+            // observer sees once (AC-1.6.2); the intermediate phases stay in the
+            // F0-07 log only.
             if (event.emission.transition == env::EmissionTransition::Warn ||
                 event.emission.transition == env::EmissionTransition::Start) {
                 channel.observe_event(
                     "emission_start",
+                    {{"cycle", bot::SJson::make_number(static_cast<double>(event.emission.cycle))},
+                     {"world_ms",
+                      bot::SJson::make_number(static_cast<double>(event.emission.at_ms))}});
+            } else if (event.emission.transition == env::EmissionTransition::End) {
+                channel.observe_event(
+                    "emission_end",
                     {{"cycle", bot::SJson::make_number(static_cast<double>(event.emission.cycle))},
                      {"world_ms",
                       bot::SJson::make_number(static_cast<double>(event.emission.at_ms))}});
@@ -345,20 +434,22 @@ struct CCoreRuntime::SImpl {
 
         if (stats.reconnects_reclaimed > seen_reclaims) {
             seen_reclaims = stats.reconnects_reclaimed;
-            channel.observe_event("player_rejoin", {});
+            observe_session_event("player_rejoin");
         }
         if (stats.resumes_expired > seen_expired) {
             seen_expired = stats.resumes_expired;
-            channel.observe_event("window_expired", {});
+            observe_session_event("window_expired");
         }
         if (stats.builds_rejected > seen_build_rejects) {
             seen_build_rejects = stats.builds_rejected;
-            std::vector<std::string> paths;
+            // Only the in-process profile has the loopback peer whose refusal
+            // paths this process owns. Over the network the refused client is not
+            // in the session (a broadcast cannot reach it), so it observes its own
+            // refusal from the verdict it received (see `observe_client_rejection`).
             if (peer_session != nullptr) {
-                paths = peer_session->rejection_paths();
+                channel.observe_event_files("join_rejected", peer_session->rejection_paths(),
+                                            "cfg_diff");
             }
-            // AC-1.10.1: the refusal names the divergent config paths.
-            channel.observe_event_files("join_rejected", paths, "cfg_diff");
         }
     }
 
@@ -443,6 +534,48 @@ struct CCoreRuntime::SImpl {
         item_view.refresh(records, local_player_id);
     }
 
+    // --- F0-02 client recovery ----------------------------------------------
+    //
+    // The transport never reconnects behind the owner's back and a listen host
+    // owns the session (EC-4), so the client adapter is the place that recovers a
+    // lost link: a fresh transport session on the same identity, then the host's
+    // reconnect policy (F1-10) decides — the same character inside the window,
+    // `window_expired` outside it. Only a closed transport session is restarted:
+    // a running handshake must not be reset every tick.
+    void service_client_link(std::int64_t now) {
+        if (client_session == nullptr || endpoint == nullptr) {
+            return;
+        }
+        if (!client_session->reconnecting() || !endpoint->client_closed()) {
+            return;
+        }
+        if (now < client_reconnect_at_ms) {
+            return;
+        }
+        client_reconnect_at_ms = now + kClientReconnectRetryMs;
+        if (!endpoint->reconnect_client()) {
+            note_error("transport reconnect: " + endpoint->error());
+        }
+    }
+
+    // F0-09: a refused client is not in the session, so the host cannot send it
+    // anything. The client observes its own refusal — with the divergent paths,
+    // which only it knows (AC-1.10.1).
+    void observe_client_rejection() {
+        if (client_session == nullptr || rejection_seen || !client_session->join_rejected()) {
+            return;
+        }
+        rejection_seen = true;
+        const CoreError reason = client_session->join_rejection();
+        if (reason == CoreError::BuildMismatch) {
+            channel.observe_event_files("join_rejected", client_session->rejection_paths(),
+                                        "cfg_diff");
+            return;
+        }
+        const std::string text = xrn::core::to_string(reason);
+        channel.observe_event("join_rejected", {{"reason", bot::SJson::make_string(text)}});
+    }
+
     // --- debug surface over the network (F0-02) ------------------------------
     //
     // A debug command is a host-side mechanic: the client sends it as an intent
@@ -478,11 +611,15 @@ struct CCoreRuntime::SImpl {
                 foreign.push_back(std::move(message));
                 continue;
             }
+            // The intent is executed for the peer that sent it (F0-02): a drop
+            // must hit exactly that player, never "whoever is around".
+            debug_requester = message.from;
             std::string name;
             std::string argument;
             split_debug(message.payload, name, argument);
             std::string detail;
             const bool accepted = coop::core_runtime().command(name, argument, detail);
+            debug_requester = 0;
             if (accepted) {
                 channel.observe_event("debug_command", {{"command", bot::SJson::make_string(name)},
                                                         {"detail", bot::SJson::make_string(detail)}});
@@ -498,9 +635,33 @@ struct CCoreRuntime::SImpl {
             ack.channel = kDebugAckChannel;
             ack.payload = std::string(accepted ? "done" : "failed") + kDebugFieldSeparator + detail;
             static_cast<void>(host_session->broadcast_bridge(ack));
+            apply_pending_drop();
         }
         for (BridgeMessage& kept : foreign) {
             coop::bridge().enqueue(xrn::core::to_engine<coop::SMessage>(std::move(kept)));
+        }
+    }
+
+    // The verdict is already on the wire, so the peer can answer its bot action
+    // even though the host closes its link right after (F0-02).
+    void apply_pending_drop() {
+        if (!pending_drop.armed) {
+            return;
+        }
+        const SPendingDrop drop = pending_drop;
+        pending_drop = SPendingDrop{};
+        if (host_session == nullptr) {
+            return;
+        }
+        const CoreError result = host_session->drop_peer(drop.peer, drop.mode);
+        if (failed(result)) {
+            note_error(std::string("debug.reconnect: cannot drop the peer: ") +
+                       xrn::core::to_string(result));
+            channel.observe_event(
+                "debug_unsupported",
+                {{"command", bot::SJson::make_string("debug.reconnect")},
+                 {"reason", bot::SJson::make_string(std::string("drop failed: ") +
+                                                    xrn::core::to_string(result))}});
         }
     }
 
@@ -673,12 +834,16 @@ struct CCoreRuntime::SImpl {
         answer(message, "failed", started, "unknown action type: " + action.type);
     }
 
-    // --- host verdicts -> bot channel ---------------------------------------
+    // --- inbound bridge of this process' own session -------------------------
     //
     // The verdicts of this process' own actions arrive on its own bridge: the
     // in-process peer link in a local check, the client session over the network
     // in a harness run. A debug command travels the same way and comes back on
     // `kDebugAckChannel`.
+    //
+    // Host verdicts -> bot channel, world events -> observations (F0-12), the rest
+    // -> the Lua gameplay layer (F0-05). One consumer only: the queue is drained
+    // destructively, so every channel is routed here.
     void drain_peer_verdicts(std::int64_t now) {
         for (std::size_t index = 0; index < pending.size();) {
             if (now >= pending[index].deadline_ms) {
@@ -690,6 +855,11 @@ struct CCoreRuntime::SImpl {
             ++index;
         }
 
+        // A network client is the only reader that learns the world events from
+        // the host's stream. In the in-process profile the loopback peer lives in
+        // the same process: the events its host broadcasts come back to it as an
+        // echo of what this process already observed, so they are dropped here.
+        const bool remote_client = client_session != nullptr;
         xrn::core::BridgeLink* const source =
             peer_session != nullptr
                 ? &peer_session->bridge()
@@ -699,6 +869,29 @@ struct CCoreRuntime::SImpl {
         }
         BridgeMessage message;
         while (source->pull_inbound(message)) {
+            if (message.channel == env::kBridgeChannel) {
+                if (!remote_client) {
+                    continue;
+                }
+                env::EnvironmentEvent event;
+                if (succeeded(env::decode_environment_event(message.payload, event))) {
+                    observe_environment_event(event);
+                }
+                // Same payload, same channel: the Lua layer of a client sees the
+                // events of the host (F0-05 parity).
+                coop::bridge().enqueue(xrn::core::to_engine<coop::SMessage>(std::move(message)));
+                continue;
+            }
+            if (message.channel == kObsEventChannel) {
+                if (!remote_client) {
+                    continue;
+                }
+                const std::string name = obs_event_name(message.payload);
+                if (!name.empty()) {
+                    channel.observe_event(name, {});
+                }
+                continue;
+            }
             if (message.channel == kDebugAckChannel) {
                 std::string status;
                 std::string detail;
@@ -988,8 +1181,13 @@ bool CCoreRuntime::start() {
         config.player_id = env_uint("XRN_HARNESS_SLOT", 1) + 1;
         config.player_name = impl.instance;
         config.log = impl.log.get();
-        // Listen-host semantics: a vanished host ends the session (EC-4).
-        config.host_loss_grace_ms = 0;
+        // F0-02 recovery: a lost link is not the end of the session. The adapter
+        // restarts the transport session and rejoins with the same identity while
+        // the host's reconnect window still holds the slot (F1-10) — so a peer the
+        // host dropped comes back as the same character, or learns that its window
+        // expired. Outside the grace window the session ends like a listen host
+        // without a host (EC-4).
+        config.host_loss_grace_ms = kClientReconnectGraceMs;
         impl.local_player_id = config.player_id;
         if (impl.net != nullptr) {
             impl.link = impl.net->endpoint(kClientPeerId).release();
@@ -1110,8 +1308,7 @@ void CCoreRuntime::tick() {
                     impl.observe_environment_event(event);
                 }
                 if (!events.empty()) {
-                    static_cast<void>(env::publish_environment_events(impl.host_session->bridge(),
-                                                                      events, impl.env_sequence));
+                    impl.publish_environment_events(events);
                 }
                 impl.host_session->publish();
             }
@@ -1120,6 +1317,8 @@ void CCoreRuntime::tick() {
             impl.step_reconnect_cycle(now);
         } else if (impl.client_session != nullptr) {
             impl.client_session->service();
+            impl.observe_client_rejection();
+            impl.service_client_link(now);
         }
     }
 
@@ -1197,15 +1396,36 @@ bool CCoreRuntime::command(const std::string& name, const std::string& argument,
         return true;
     }
     if (name == "debug.reconnect") {
-        if (!impl.host || impl.host_session == nullptr || impl.peer_session == nullptr) {
+        if (!impl.host || impl.host_session == nullptr) {
             detail = "reconnect is a host-side debug scenario";
             return false;
         }
-        impl.reconnect_expired = argument_value(argument, "window") == "expired";
-        impl.reconnect_phase = 1;
-        impl.reconnect_at_ms = 0;
-        detail = impl.reconnect_expired ? "peer drops, window closes, peer returns"
-                                        : "peer returns inside the window";
+        const bool expired = argument_value(argument, "window") == "expired";
+        if (impl.peer_session != nullptr) {
+            // In-process profile: the dropped peer is the loopback client of this
+            // process, so the scenario runs locally.
+            impl.reconnect_expired = expired;
+            impl.reconnect_phase = 1;
+            impl.reconnect_at_ms = 0;
+            detail = expired ? "peer drops, window closes, peer returns"
+                             : "peer returns inside the window";
+            return true;
+        }
+        if (impl.debug_requester == 0) {
+            // Network profile: there is no loopback peer to drop and the host's own
+            // bot has no link of its own. The drop is a network operation and needs
+            // a connected peer that asked for it.
+            detail = "reconnect needs a connected peer";
+            return false;
+        }
+        // The link is closed after the verdict left, so the client can answer its
+        // bot action and then recover the session (F0-02).
+        impl.pending_drop.armed = true;
+        impl.pending_drop.peer = impl.debug_requester;
+        impl.pending_drop.mode =
+            expired ? xrn::core::PeerDrop::CloseWindow : xrn::core::PeerDrop::KeepSlot;
+        detail = expired ? "peer drops, window closes, peer returns"
+                         : "peer returns inside the window";
         return true;
     }
     detail = "unknown debug command";

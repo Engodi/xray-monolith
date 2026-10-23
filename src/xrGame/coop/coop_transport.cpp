@@ -256,6 +256,20 @@ void CTransport::stop() {
     impl.port = 0;
 }
 
+bool CTransport::reconnect_client() {
+    SImpl& impl = *m_impl;
+    if (impl.host || impl.client_link == nullptr) {
+        impl.error = "reconnect is a client-side operation";
+        return false;
+    }
+    impl.error.clear();
+    if (!impl.client_link->reconnect()) {
+        impl.error = transport_error("xnt_client_reconnect");
+        return false;
+    }
+    return true;
+}
+
 bool CTransport::running() const noexcept {
     return m_impl->started && m_impl->link != nullptr;
 }

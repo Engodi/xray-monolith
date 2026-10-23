@@ -23,8 +23,8 @@ CLevel::OnFrame
 |---|---|---|
 | Транспорт F0-02 (кросс-процессный UDP) | `coop/coop_transport.*` → `xrn::core::HostTransportLink` / `ClientTransportLink`; `transport_link.cpp` собран в xrGame | `tests/cpp/coop/run_core.sh` (host + client в разных процессах по UDP loopback) |
 | Тик ядра в игровом цикле | `CLevel::OnFrame` → `core_runtime().tick()`; фиксированный шаг 20 мс, ограничение догона 200 мс | `tests/cpp/coop/run_core.sh` (шаги/тик растут) |
-| Публикация событий мира в Lua | `env::publish_environment_events` → `HostSession::bridge()` → `coop::bridge().pump()` → `coop.sync.on_inbound` | `tests/lua/coop/test_core.lua` (сырой канал `environment` → `coop.events`) |
-| События мира в наблюдения ботов | `coop_bot_channel` из `ccop_core_runtime` (`weather`, `emission_start`, `time_sync`, `player_rejoin`, `window_expired`, `join_rejected`) | `tests/cpp/coop/run_core.sh` |
+| Публикация событий мира в Lua | `env::publish_environment_events` → `HostSession::bridge()` → `coop::bridge().pump()` → `coop.sync.on_inbound`; тот же поток уходит клиентам (`HostSession::broadcast_bridge`), клиент декодирует его в свои наблюдения и в свой Lua-слой | `tests/lua/coop/test_core.lua` (сырой канал `environment` → `coop.events`), `tests/cpp/coop/run_core.sh` (хост + клиент видят одинаковый набор событий) |
+| События мира в наблюдения ботов | `coop_bot_channel` из `ccop_core_runtime` (`weather`, `emission_start`, `emission_end`, `time_sync`, `player_rejoin`, `window_expired`, `join_rejected`); хост рассылает их клиентам (`coop.obs.event`), поэтому `observer = peer` выполняется и по сети | `tests/cpp/coop/run_core.sh` |
 | Артефакт F0-07 | `EventLog::write_jsonl` → `<run-dir>/<instance>.jsonl`, `obs::Metrics` → `<instance>.metrics.json` | `obs::read_jsonl` в тесте + `xrn_core_runlog merge` |
 | Интенты ботов в `HostSession` + ack | `coop_bot_channel` (inbox) → `ClientSession::bridge()` → `HostSession` → вердикт → `outbox` + `observations.jsonl` | `tests/cpp/coop/run_core.sh` (подбор `bread` получает вердикт хоста) |
 
@@ -98,7 +98,24 @@ CTransport (coop/coop_transport.*)          xnt C ABI (src/transport/include/xnt
   интентом по мосту (`coop.debug.intent`), хост исполняет и отвечает
   (`coop.debug.ack`, широковещательно, по `seq`), бот получает ответ только
   после вердикта хоста. В in-process профиле команда исполняется локально, как
-  раньше.
+  раньше. Интент приходит с идентификатором отправителя (`BridgeMessage::from`),
+  поэтому команда, меняющая *конкретного* пира (`debug.reconnect`), действует
+  ровно на того, кто её послал.
+* Поток событий мира идёт от хоста всем: каждое событие среды уходит и в свой
+  Lua-слой, и каждому клиенту (`broadcast_bridge`, канал `environment`); клиент
+  декодирует его тем же кодеком и наблюдает у себя, поэтому набор и порядок
+  событий у клиента совпадают с хостом (`observer = peer` по сети). События
+  сессии (`player_rejoin`, `window_expired`) хост тоже рассылает — отдельным
+  каналом `coop.obs.event` (`event=<имя>`). Echo в in-process профиле (loopback-
+  пир живёт в том же процессе) отбрасывается: хост уже наблюдал эти события.
+* Восстановление клиента (F0-02): потеряв линк, клиент не завершает сессию, а
+  поднимает новую транспортную сессию на том же сокете (`xnt_client_reconnect`,
+  `CTransport::reconnect_client`) и входит снова с той же идентичностью; хост
+  применяет политику окна реконнекта (F1-10) — тот же персонаж внутри окна,
+  `window_expired` вне его. Хост закрывает линк конкретного пира через
+  `HostSession::drop_peer(peer, PeerDrop::KeepSlot|CloseWindow)` поверх
+  `xnt_host_disconnect`; `CloseWindow` освобождает слот и убирает персонажа
+  сразу (следующий вход получает явный `window_expired`).
 * Сетка слотов: хост + 3 клиента = 4 слота. Поэтому в сетевом профиле у хоста
   **нет** loopback-пира: его бот действует как собственный игрок хоста (слот 0),
   а слоты 1..3 занимают реальные клиентские процессы.
@@ -110,11 +127,11 @@ CTransport (coop/coop_transport.*)          xnt C ABI (src/transport/include/xnt
 
 | Команда | Что делает | Событие наблюдений |
 |---|---|---|
-| `debug.weather [type=fog]` | прокручивает цикл погоды хоста на один шаг (≥ одного dwell) | `weather` |
-| `debug.emission start` | `EnvironmentAuthority::trigger_emission()` | `emission_start` |
-| `debug.clock sync` | `set_world_time(+1 игровая минута)` | `time_sync` |
-| `debug.reconnect window=ok` | отбрасывает loopback-пира и возвращает его внутри окна (in-process профиль; в сетевом — `debug_unsupported`) | `player_rejoin` |
-| `debug.reconnect window=expired` | то же, но возврат после закрытия окна (600 мс в debug-профиле), также только in-process | `window_expired` |
+| `debug.weather [type=fog]` | прокручивает цикл погоды хоста на один шаг (≥ одного dwell) | `weather` (виден всем) |
+| `debug.emission start` | `EnvironmentAuthority::trigger_emission()` | `emission_start` (виден всем) |
+| `debug.clock sync` | `set_world_time(+1 игровая минута)` | `time_sync` (виден всем) |
+| `debug.reconnect window=ok` | рвёт линк пира, который послал команду, и держит его слот в окне реконнекта: возврат внутри окна — тот же персонаж (`HostSession::drop_peer(KeepSlot)`); в in-process профиле отбрасывается loopback-пир | `player_rejoin` |
+| `debug.reconnect window=expired` | то же, но окно закрывается сразу (600 мс в debug-профиле): слот свободен, персонаж уходит, возврат — явный `window_expired` (`drop_peer(CloseWindow)`) | `window_expired` |
 
 `debug.cfg_probe` и `debug.level_change` пока **не** реализованы: адаптер
 отвечает `done`, но публикует `debug_unsupported` с причиной, чтобы сценарий
@@ -122,18 +139,30 @@ e2e падал на ассерте события, а не «зеленел» м
 
 ## 5. Ограничения (честно)
 
-* **Транспорт F0-02 подключён (UDP), но debug-поверхность ещё не полностью
-  кросс-процессная.**
-  - `debug.reconnect` работает только в in-process профиле: он отбрасывает
-    loopback-пира хоста. Чтобы дропнуть конкретного удалённого клиента нужен
-    API транспорта/ядра (`xnt_host` не умеет разрывать сессию, `HostSession::kick`
-    освобождает слот сразу и не запускает окно реконнекта). В сетевом профиле
-    команда честно отвечает `debug_unsupported`.
-  - События мира (`player_rejoin`, `window_expired`, `weather`, ...) пишет
-    канал того процесса, который их наблюдал: у клиентов нет широковещательной
-    рассылки наблюдений хоста. Ассерты `observer = peer` на событиях пока
-    выполняются только для in-process профиля.
-  - `debug.cfg_probe` / `debug.level_change` по-прежнему не реализованы.
+* **`debug.reconnect` работает и по сети.** Хост закрывает линк конкретного пира
+  (`xnt_host_disconnect` → `HostSession::drop_peer`), клиент сам поднимает новую
+  транспортную сессию и входит снова (`xnt_client_reconnect`), окно реконнекта
+  решает исход (`player_rejoin` / `window_expired`). Ограничения этого пути:
+  - адресация только по «пир, пославший интент»: дропнуть пира, который сам
+    ничего не присылал, командой бота нельзя (нужен административный вызов
+    `HostSession::drop_peer` из Lua/UI — не подключён);
+  - клиент восстанавливается, пока жив процесс и пока идёт grace-окно
+    (2×600 мс в debug-профиле); после него сессия завершается как EC-4, и
+    переподключение потребует перезапуска клиента;
+  - транспортная сессия поднимается заново на том же сокете; потеря самих
+    UDP-датаграмм отбрасывается надёжным каналом (retransmit), как и раньше.
+* **События мира видны клиентам.** Хост рассылает их двумя каналами: поток
+  `environment` (F0-05, тот же, что уходит в Lua) и `coop.obs.event` для событий
+  сессии (`player_rejoin`, `window_expired`). Клиентский бот получает их в свой
+  `observations.jsonl`, поэтому `observer = peer` по сети выполняется.
+  Ограничения:
+  - `join_rejected` + `files` наблюдает сам отклонённый клиент (хост не может
+    адресовать пира, которого нет в сессии) — в сетевом профиле у хоста это
+    событие не публикуется вовсе;
+  - `level_change` (F1-13) в наблюдения ботов не выведен — команда
+    `debug.level_change` по-прежнему `debug_unsupported`;
+  - в in-process профиле echo событий через loopback-пира отбрасывается, чтобы
+    хост не считал их дважды.
 * **GNS не линкуется.** `xnt` — самостоятельный транспорт: надёжная/ненадёжная
   доставка, фрагментация, RTT и keepalive реализованы в самом `xnt` поверх
   обычного UDP, а GameNetworkingSockets v1.6.1 остаётся его LAN-швом
@@ -141,7 +170,8 @@ e2e падал на ассерте события, а не «зеленел» м
   `gns: unavailable — built without XNET_WITH_GNS`.
 * **Компиляция движка — только CI (MSVC/VS2022, F0-01).** Локально проверены:
   адаптер против реального ядра: `tests/cpp/coop/run_core.sh` (g++ и clang++,
-  in-process профиль + два процесса по UDP),
+  in-process профиль + два процесса по UDP: подбор, событие хоста у клиента,
+  дроп пира → возврат в окне и вне окна),
   файловый канал/JSON (`tests/cpp/coop/run.sh`) и Lua-слой
   (`tests/lua/coop/run.lua`, 56 тестов).
 * **`tools/diff/merge.py` (xray-net) отстал от формата.** Python-фолбэк

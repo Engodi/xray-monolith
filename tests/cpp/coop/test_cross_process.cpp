@@ -158,6 +158,21 @@ std::string result_value(const fs::path& run_dir, const std::string& instance, c
     return std::string();
 }
 
+// Observations appended after `from` (0-based line index): used to prove that a
+// client still sees its state *after* the reconnect, not only before it.
+bool has_observation_from(const fs::path& observations, std::size_t from,
+                          const std::string& needle) {
+    const std::vector<std::string> lines = lines_of(observations);
+    for (std::size_t index = from; index < lines.size(); ++index) {
+        if (lines[index].find(needle) != std::string::npos) {
+            return true;
+        }
+    }
+    return false;
+}
+
+std::size_t line_count(const fs::path& path) { return lines_of(path).size(); }
+
 // --- host process ---------------------------------------------------------
 int run_host(const fs::path& run_dir) {
     arm_environment(run_dir.string(), "host", "host", 0, "0");
@@ -171,23 +186,25 @@ int run_host(const fs::path& run_dir) {
     }
 
     const fs::path observations = bot / "observations.jsonl";
+    // The client writes this marker when its scenario (pickup, weather, reconnect
+    // both ways) is done: the host must stay up for all of it.
+    const fs::path done = run_dir / "client-1" / "done";
     bool pickup = false;
     unsigned max_peers = 0;
-    int picked_at = -1;
     for (int elapsed = 0; elapsed < kHostBudgetMs; elapsed += kTickSleepMs) {
         runtime.tick();
         std::this_thread::sleep_for(std::chrono::milliseconds(kTickSleepMs));
         max_peers = std::max(max_peers, runtime.status().peers);
         if (elapsed % (kTickSleepMs * 5) == 0) {
             // The client's pickup intent must have been applied by the authority.
-            pickup = has_observation(observations, "\"event\":\"pickup\"");
-            if (pickup && picked_at < 0) {
-                picked_at = elapsed;
-            }
+            pickup = pickup || has_observation(observations, "\"event\":\"pickup\"");
         }
-        // Stay a moment after the verdict left: the client must still be able to
-        // receive its ack (it observes state only from the host's stream).
-        if (pickup && elapsed >= picked_at + kHostGraceMs) {
+        if (fs::exists(done)) {
+            // Let the last verdicts/events reach the client before the session ends.
+            for (int grace = 0; grace < kHostGraceMs; grace += kTickSleepMs) {
+                runtime.tick();
+                std::this_thread::sleep_for(std::chrono::milliseconds(kTickSleepMs));
+            }
             break;
         }
     }
@@ -216,29 +233,41 @@ int run_client(const fs::path& run_dir) {
     }
 
     const fs::path observations = bot / "observations.jsonl";
-    bool pickup_acked = false;
-    bool debug_acked = false;
+    const fs::path outbox = bot / "outbox";
+    bool sent_pickup = false;
     bool pickup = false;
     bool inventory = false;
-    bool sent_pickup = false;
-    
+    bool inventory_after_rejoin = false;
+    bool weather = false;
+    bool rejoin = false;
+    bool expired = false;
+    bool rejoin_sent = false;
+    bool expired_sent = false;
+    bool rejoin_acked = false;
+    bool expired_acked = false;
+    bool joined_after_rejoin = false;
+    std::size_t rejoin_index = 0;
+
     for (int elapsed = 0; elapsed < kClientBudgetMs; elapsed += kTickSleepMs) {
         runtime.tick();
         std::this_thread::sleep_for(std::chrono::milliseconds(kTickSleepMs));
         const coop::SCoreStatus status = runtime.status();
         if (status.joined && !sent_pickup) {
+            // 1: a pickup intent (the host's authority decides), 2: a host-side
+            // world event (weather) the client must observe over the network.
             push_action(bot, 1, "\"type\":\"pickup\",\"item\":\"bread\"");
-            push_action(bot, 2, "\"type\":\"send\",\"command\":\"debug.clock sync\"");
+            push_action(bot, 2, "\"type\":\"send\",\"command\":\"debug.weather type=fog\"");
             sent_pickup = true;
-
         }
         if (elapsed % (kTickSleepMs * 5) != 0) {
             continue;
         }
-        pickup_acked = pickup_acked || fs::exists(bot / "outbox" / "0001.json");
-        debug_acked = debug_acked || fs::exists(bot / "outbox" / "0002.json");
-        // The client sees the result only through mirrored snapshots.
-        pickup = has_observation(observations, "\"event\":\"pickup\"");
+        const bool pickup_acked = fs::exists(outbox / "0001.json");
+        const bool weather_acked = fs::exists(outbox / "0002.json");
+        // The client sees the result only through mirrored snapshots and the
+        // host's event stream (F0-02).
+        pickup = pickup || has_observation(observations, "\"event\":\"pickup\"");
+        weather = weather || has_observation(observations, "\"event\":\"weather\"");
         for (const std::string& line : lines_of(observations)) {
             if (line.find("\"kind\":\"state\"") != std::string::npos &&
                 line.find("\"id\":\"bread\"") != std::string::npos) {
@@ -246,18 +275,61 @@ int run_client(const fs::path& run_dir) {
                 break;
             }
         }
-        if (pickup && debug_acked && inventory) {
+
+        // Step 3: the host drops this peer's link; the client must recover the
+        // session on its own and be resumed inside the window (F1-10).
+        if (!rejoin_sent && pickup_acked && weather_acked && inventory && weather) {
+            push_action(bot, 3, "\"type\":\"send\",\"command\":\"debug.reconnect window=ok\"");
+            rejoin_sent = true;
+        }
+        if (rejoin_sent) {
+            rejoin_acked = rejoin_acked || fs::exists(outbox / "0003.json");
+            if (!rejoin) {
+                rejoin = has_observation(observations, "\"event\":\"player_rejoin\"");
+                if (rejoin) {
+                    // Everything after this line is observed *after* the rejoin.
+                    rejoin_index = line_count(observations);
+                }
+            }
+            joined_after_rejoin = joined_after_rejoin || status.joined;
+            if (rejoin) {
+                inventory_after_rejoin =
+                    inventory_after_rejoin ||
+                    has_observation_from(observations, rejoin_index, "\"id\":\"bread\"");
+            }
+        }
+
+        // Step 4: the same drop, but the host closes the window at once: the
+        // return is an explicit "window expired" with a new character.
+        if (rejoin && rejoin_acked && !expired_sent) {
+            push_action(bot, 4, "\"type\":\"send\",\"command\":\"debug.reconnect window=expired\"");
+            expired_sent = true;
+        }
+        if (expired_sent) {
+            expired_acked = expired_acked || fs::exists(outbox / "0004.json");
+            expired = expired || has_observation(observations, "\"event\":\"window_expired\"");
+        }
+        if (expired && expired_acked && inventory_after_rejoin) {
             break;
         }
     }
+    // The host stays up until this marker appears.
+    write_text(run_dir / "client-1" / "done", "done\n");
     const coop::SCoreStatus status = runtime.status();
     runtime.shutdown();
-    write_result(run_dir, "client-1", pickup, debug_acked, inventory, status.transport,
-                 status.peers, status.joined);
-    if (!pickup || !debug_acked || !inventory) {
+    write_result(run_dir, "client-1", pickup, expired_acked, inventory, status.transport,
+                 status.peers, joined_after_rejoin || status.joined);
+    if (!pickup || !expired_acked || !inventory) {
         std::cout << "client: joined=" << status.joined << " pickup=" << pickup
-                  << " debug_ack=" << debug_acked << " inventory=" << inventory
-                  << " acked=" << pickup_acked << " transport=" << status.transport << "\n";
+                  << " expired_ack=" << expired_acked << " inventory=" << inventory
+                  << " transport=" << status.transport << "\n";
+        return 1;
+    }
+    if (!weather || !rejoin || !inventory_after_rejoin || !expired || !rejoin_acked ||
+        !joined_after_rejoin) {
+        std::cout << "client: weather=" << weather << " rejoin=" << rejoin
+                  << " rejoin_ack=" << rejoin_acked << " inventory_after=" << inventory_after_rejoin
+                  << " expired=" << expired << " joined_after=" << joined_after_rejoin << "\n";
         return 1;
     }
     return 0;
@@ -351,12 +423,27 @@ int run_driver(const fs::path& run_dir) {
     check(result_flag(run_dir, "client-1", "joined"), "client joined the session over UDP");
     check(result_flag(run_dir, "client-1", "pickup"), "client got its pickup verdict");
     check(result_flag(run_dir, "client-1", "debug_ack"),
-          "client got the debug verdict over the network");
+          "client got the reconnect verdict over the network");
     check(result_flag(run_dir, "client-1", "inventory"),
           "client sees its inventory through snapshots");
     check(result_flag(run_dir, "host", "pickup"), "host applied the client's intent");
     check(result_value(run_dir, "host", "peers") == "2",
           "host saw the client's player row in the session");
+
+    // F0-02 event fan-out: the world events the host publishes reach the client
+    // bot (`observer = peer` over the network, not only in-process).
+    const fs::path host_observations = run_dir / "host" / "bot" / "observations.jsonl";
+    const fs::path client_observations = run_dir / "client-1" / "bot" / "observations.jsonl";
+    for (const char* event : {"weather", "player_rejoin", "window_expired"}) {
+        const std::string needle = std::string("\"event\":\"") + event + "\"";
+        check(has_observation(host_observations, needle),
+              std::string("host observed ") + event);
+        check(has_observation(client_observations, needle),
+              std::string("client observed ") + event);
+    }
+    // F1-10 over the network: the client came back into the session after the drop.
+    check(has_observation(client_observations, "\"event\":\"player_rejoin\""),
+          "client returned inside the reconnect window");
 
     // Artifacts of both processes are valid F0-07 files with session events.
     for (const char* instance : {"host", "client-1"}) {
