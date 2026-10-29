@@ -120,6 +120,20 @@ ENGINE_API bool is_enough_address_space_available()
 	//    return (*(u32*)&system_info.lpMaximumApplicationAddress) > 0x90000000;
 }
 
+// F0-04: a headless process must not look like it is loading a renderer. The
+// renderer is statically linked (STATIC_RENDERER_R*), so there is no library to
+// load; attaching it only wires ::Render / RenderFactory for the CPU-only render
+// core, and no D3D device, swap chain or shader is ever created. Keep the attach
+// (the simulation refers to those globals) but never emit the misleading
+// "Loading DLL: xrRender_R*.dll" line in a headless process.
+inline void log_renderer_attach(LPCSTR renderer_name)
+{
+	if (Headless::Active())
+		Msg("* [headless] renderer %s: CPU-only, no device, no shaders", renderer_name);
+	else
+		Log("Loading DLL:", renderer_name);
+}
+
 #ifndef DEDICATED_SERVER
 
 extern BOOL DllMainXrRenderR1(HANDLE hModule, DWORD ul_reason_for_call, LPVOID lpReserved);
@@ -151,7 +165,7 @@ void CEngineAPI::InitializeNotDedicated()
         // try to initialize R4
 		psDeviceFlags.set(rsR2, FALSE);
 		psDeviceFlags.set(rsR3, FALSE);
-		Log("Loading DLL:", r4_name);
+		log_renderer_attach(r4_name);
 		DllMainXrRenderR4(NULL, DLL_PROCESS_ATTACH, NULL);
         //hRender = LoadLibrary(r4_name);
 	//if (0 == hRender)
@@ -170,7 +184,7 @@ void CEngineAPI::InitializeNotDedicated()
 		// try to initialize R3
 		psDeviceFlags.set(rsR2, FALSE);
 		psDeviceFlags.set(rsR4, FALSE);
-		Log("Loading DLL:", r3_name);
+		log_renderer_attach(r3_name);
 		DllMainXrRenderR3(NULL, DLL_PROCESS_ATTACH, NULL);
 		//hRender = LoadLibrary(r3_name);
 		//if (0 == hRender)
@@ -190,7 +204,7 @@ void CEngineAPI::InitializeNotDedicated()
         // try to initialize R2
         psDeviceFlags.set(rsR3, FALSE);
 		psDeviceFlags.set(rsR4, FALSE);
-		Log("Loading DLL:", r2_name);
+		log_renderer_attach(r2_name);
 		DllMainXrRenderR2(NULL, DLL_PROCESS_ATTACH, NULL);
 		//hRender = LoadLibrary(r2_name);
 	//if (0 == hRender)
@@ -232,7 +246,7 @@ void CEngineAPI::Initialize(void)
         psDeviceFlags.set(rsR2, FALSE);
         renderer_value = 0; //con cmd
 
-        Log("Loading DLL:", r1_name);
+        log_renderer_attach(r1_name);
 		DllMainXrRenderR1(NULL, DLL_PROCESS_ATTACH, NULL);
 		//hRender = LoadLibrary(r1_name);
 	//if (0 == hRender) R_CHK(GetLastError());
@@ -361,7 +375,7 @@ void CEngineAPI::CreateRendererList()
 	{
 #ifdef STATIC_RENDERER_R2
 		// try to initialize R2
-        Log("Loading DLL:", r2_name);
+        log_renderer_attach(r2_name);
         //hRender = LoadLibrary(r2_name);
 		DllMainXrRenderR2(NULL, DLL_PROCESS_ATTACH, NULL);
         //if (hRender)
@@ -377,7 +391,7 @@ void CEngineAPI::CreateRendererList()
 
 #ifdef STATIC_RENDERER_R3
 		// try to initialize R3
-		Log("Loading DLL:", r3_name);
+		log_renderer_attach(r3_name);
 		// Hide "d3d10.dll not found" message box for XP
 		SetErrorMode(SEM_FAILCRITICALERRORS);
 		//hRender = LoadLibrary(r3_name);
@@ -396,7 +410,7 @@ void CEngineAPI::CreateRendererList()
 
 #ifdef STATIC_RENDERER_R4
 		// try to initialize R4
-        Log("Loading DLL:", r4_name);
+        log_renderer_attach(r4_name);
         // Hide "d3d10.dll not found" message box for XP
         SetErrorMode(SEM_FAILCRITICALERRORS);
         //hRender = LoadLibrary(r4_name);

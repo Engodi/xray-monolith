@@ -70,6 +70,7 @@ public:
 	IC const CALifeSimulator* get_alife() const;
 	IC const CCoverManager& cover_manager() const;
 	IC CScriptEngine& script_engine() const;
+	IC CScriptEngine* get_script_engine() const;
 	IC moving_objects& moving_objects() const;
 	IC doors::manager& doors() const;
 

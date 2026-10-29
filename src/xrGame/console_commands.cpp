@@ -399,8 +399,21 @@ static void full_memory_stats()
 	CInifile::GetCacheStats(DLTX_files_cached, DLTX_total_bytes, DLTX_section_count);
 	Msg("* [x-ray]: DLTX Cache: Files Cached: %zu, Sections Total %zu, Usage: %.2f MB", DLTX_files_cached, DLTX_section_count, (double)DLTX_total_bytes / 1024 / 1024);
 	
-	size_t lua_mem = lua_gc(ai().script_engine().lua(), LUA_GCCOUNT, 0);
-	Msg("* [Lua]: Memory usage: %u K", lua_mem);
+	// Headless / dedicated (F0-04): a process that runs without a render window
+	// does not create the game script engine, so the Lua state may be absent.
+	// Calling lua_gc on a null state faulted during startup (long before the
+	// level was loaded) and the crash happened while the log buffer was still
+	// unflushed, so the harness saw an empty engine log.
+	CScriptEngine* script_engine = ai().get_script_engine();
+	if (script_engine)
+	{
+		size_t lua_mem = lua_gc(script_engine->lua(), LUA_GCCOUNT, 0);
+		Msg("* [Lua]: Memory usage: %u K", lua_mem);
+	}
+	else
+	{
+		Msg("* [Lua]: Memory usage: script engine is not running");
+	}
 
 #ifdef FS_DEBUG
 	Msg("* [x-ray]: file mapping: memory[%d K], count[%d]", g_file_mapped_memory / 1024, g_file_mapped_count);

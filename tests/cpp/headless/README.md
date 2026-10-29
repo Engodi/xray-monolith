@@ -21,11 +21,18 @@ tests/cpp/headless/run.sh
   `-dbg_alife_off/on`, `-dbg_teleport`, repeated `-dbg_spawn` (max 8, section
   case preserved) and their `XRAY_DBG_*` mirrors;
 - the production-safe behaviour: without `-coop_debug` every debug getter
-  returns the default value even when the flags were passed.
+  returns the default value even when the flags were passed;
+- **startup gates** (`check_startup_gates.py`, structural): the renderer is
+  never announced as a loaded DLL in a headless process, `CRenderDevice::Create`
+  takes the `CreateHeadless()` branch before `Starting RENDER device...`, the
+  renderer entry points (`dxRenderDeviceRender::Create`/`OnDeviceCreate`,
+  `CRender::create`, `CRender::level_Load`) keep their headless early returns
+  before the first GPU/shader call, and `full_memory_stats` never calls
+  `lua_gc` on the (absent) headless script engine.
 
 ## What is *not* covered
 
-- Anything that needs Windows/D3D: device creation, the headless tick loop,
-  render/sound/UI gating in the engine, the deferred debug-command dispatch.
-  Those are compiled and executed by the engine CI (F0-01) and the Wine/Proton
-  harness (F0-11).
+- Anything that needs Windows/D3D: real device creation, the headless tick
+  loop, the actual absence of `D3D11CreateDevice` at runtime, the deferred
+  debug-command dispatch. Those are compiled and executed by the engine CI
+  (F0-01) and the Wine/Proton harness (F0-11).

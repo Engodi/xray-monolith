@@ -121,3 +121,11 @@ if [[ "$fail" -ne 0 ]]; then
     exit 1
 fi
 echo "headless flag checks: OK"
+
+# Structural gate for the startup path (renderer must stay cold in headless).
+python_bin="${PYTHON:-python3}"
+if command -v "$python_bin" >/dev/null 2>&1; then
+    "$python_bin" "$here/check_startup_gates.py" --root "$root"
+else
+    echo "skip  startup gates (no $python_bin)" >&2
+fi

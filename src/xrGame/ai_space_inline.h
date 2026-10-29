@@ -65,6 +65,14 @@ IC CScriptEngine& CAI_Space::script_engine() const
 	return (*m_script_engine);
 }
 
+// Non-asserting accessor: a headless/dedicated process never initialises the
+// script engine, and callers such as `full_memory_stats` must be able to ask
+// for it without tripping the VERIFY or dereferencing null (F0-04).
+IC CScriptEngine* CAI_Space::get_script_engine() const
+{
+	return (m_script_engine);
+}
+
 IC const CPatrolPathStorage& CAI_Space::patrol_paths() const
 {
 	VERIFY(m_patrol_path_storage);
