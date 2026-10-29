@@ -100,6 +100,29 @@ bool has_observation(const fs::path& observations, const std::string& needle) {
     return false;
 }
 
+std::size_t count_observations(const fs::path& observations, const std::string& needle) {
+    std::size_t count = 0;
+    for (const std::string& line : lines_of(observations)) {
+        if (line.find(needle) != std::string::npos) {
+            ++count;
+        }
+    }
+    return count;
+}
+
+// The last `kind=state` observation: the periodic state stream is what a bot
+// (and the cross-instance diff) reads, so the assertions below never peek into
+// core internals.
+std::string last_state_observation(const fs::path& observations) {
+    const std::vector<std::string> lines = lines_of(observations);
+    for (auto it = lines.rbegin(); it != lines.rend(); ++it) {
+        if (it->find("\"kind\":\"state\"") != std::string::npos) {
+            return *it;
+        }
+    }
+    return std::string();
+}
+
 }  // namespace
 
 int main() {
@@ -144,11 +167,17 @@ int main() {
 
     push_action(inbox, 2, "\"type\":\"send\",\"command\":\"debug.emission start\"", "run-1");
     pump(runtime, 5);
-    check(has_observation(observations, "\"event\":\"emission_start\""), "emission start observed");
+    // QA-F5 / AC-1.6.2: the warning is a phase of the cycle, not the start of the
+    // emission. A bot observes exactly one `emission_start` per cycle — the Start
+    // boundary, when the emission itself begins.
+    check(!has_observation(observations, "\"event\":\"emission_start\""),
+          "the warning phase publishes no emission_start");
 
     push_action(inbox, 3, "\"type\":\"send\",\"command\":\"debug.clock sync\"", "run-1");
     pump(runtime, 5);
     check(has_observation(observations, "\"event\":\"time_sync\""), "time sync observed");
+    check(count_observations(observations, "\"event\":\"emission_start\"") == 1,
+          "the emission start is observed exactly once");
 
     // --- bot intent reaches HostSession and gets a verdict -------------------
     push_action(inbox, 4, "\"type\":\"pickup\",\"item\":\"bread\"", "run-1");
@@ -156,21 +185,45 @@ int main() {
     check(fs::exists(root / "host" / "bot" / "outbox" / "0004.json"), "pickup acked by the host");
     check(has_observation(observations, "\"event\":\"pickup\""), "pickup verdict observed");
 
+    // --- F1-01 (US-1.2): a `move_to` moves the sender's own character --------
+    // The intent travels to the host authority, which moves the actor record of
+    // the sender's slot; the position is asserted from the observed state.
+    push_action(inbox, 5,
+                "\"type\":\"move_to\",\"target\":\"waypoint\","
+                "\"pos\":{\"x\":12,\"y\":0,\"z\":4}",
+                "run-1");
+    pump(runtime, 20, 10);
+    check(fs::exists(root / "host" / "bot" / "outbox" / "0005.json"), "move acked by the host");
+    check(has_observation(observations, "\"event\":\"move\""), "move observed");
+    check(last_state_observation(observations).find("\"pos\":[12,0,4]") != std::string::npos,
+          "the character stands at the waypoint");
+
+    // --- F1-02 (US-1.3): a `drop` puts the same item back into the world -----
+    // The bread picked up above returns to the world as the same entity (no
+    // duplicate) and leaves the inventory.
+    push_action(inbox, 6, "\"type\":\"drop\",\"item\":\"bread\"", "run-1");
+    pump(runtime, 20, 10);
+    check(fs::exists(root / "host" / "bot" / "outbox" / "0006.json"), "drop acked by the host");
+    check(has_observation(observations, "\"event\":\"drop\""), "drop observed");
+    check(last_state_observation(observations)
+                  .find("\"world_items\":[{\"count\":1,\"id\":\"bread\"}]") != std::string::npos,
+          "the dropped item is back in the world");
+
     // --- reconnect scenario (AC-1.12) ---------------------------------------
-    push_action(inbox, 5, "\"type\":\"send\",\"command\":\"debug.reconnect window=ok\"", "run-1");
+    push_action(inbox, 7, "\"type\":\"send\",\"command\":\"debug.reconnect window=ok\"", "run-1");
     pump(runtime, 60, 10);
     check(has_observation(observations, "\"event\":\"player_rejoin\""),
           "in-window rejoin observed");
 
-    push_action(inbox, 6, "\"type\":\"send\",\"command\":\"debug.reconnect window=expired\"",
+    push_action(inbox, 8, "\"type\":\"send\",\"command\":\"debug.reconnect window=expired\"",
                 "run-1");
     pump(runtime, 120, 10);
     check(has_observation(observations, "\"event\":\"window_expired\""), "expired window observed");
 
     // --- build comparison (F0-09, AC-1.10) ----------------------------------
-    push_action(inbox, 7, "\"type\":\"send\",\"command\":\"debug.cfg_probe\"", "run-1");
+    push_action(inbox, 9, "\"type\":\"send\",\"command\":\"debug.cfg_probe\"", "run-1");
     pump(runtime, 5);
-    check(fs::exists(root / "host" / "bot" / "outbox" / "0007.json"), "build probe acked");
+    check(fs::exists(root / "host" / "bot" / "outbox" / "0009.json"), "build probe acked");
     check(has_observation(observations, "\"event\":\"cfg_check\""), "build check observed");
     check(!has_observation(observations, "\"event\":\"join_rejected\""),
           "a matching build publishes no join_rejected");
@@ -178,7 +231,7 @@ int main() {
     // The in-process profile wires no build gate (its loopback peer is a local
     // check, not a joining player), so a divergent probe has to fail honestly
     // instead of pretending the build was refused by a host verdict.
-    push_action(inbox, 8,
+    push_action(inbox, 10,
                 "\"type\":\"send\",\"command\":\"debug.cfg_probe mismatch=weapon_ammo.ltx\"",
                 "run-1");
     pump(runtime, 5);
@@ -186,16 +239,16 @@ int main() {
           "a divergent probe without a gate is refused honestly");
 
     // --- group level change (F1-13, AC-3.3) ---------------------------------
-    push_action(inbox, 9,
+    push_action(inbox, 11,
                 "\"type\":\"send\",\"command\":\"debug.level_change level=l02_darkvalley\"",
                 "run-1");
     pump(runtime, 40, 20);
-    check(fs::exists(root / "host" / "bot" / "outbox" / "0009.json"), "level change acked");
+    check(fs::exists(root / "host" / "bot" / "outbox" / "0011.json"), "level change acked");
     check(has_observation(observations, "\"event\":\"level_change\""), "level change observed");
     check(has_observation(observations, "\"level\":\"l02_darkvalley\""),
           "the group stands in the target map");
 
-    push_action(inbox, 10, "\"type\":\"send\",\"command\":\"debug.level_change level=l99_unknown\"",
+    push_action(inbox, 12, "\"type\":\"send\",\"command\":\"debug.level_change level=l99_unknown\"",
                 "run-1");
     pump(runtime, 5);
     check(has_observation(observations, "unknown level: l99_unknown"),

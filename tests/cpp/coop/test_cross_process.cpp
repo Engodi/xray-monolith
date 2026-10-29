@@ -97,6 +97,16 @@ bool has_observation(const fs::path& observations, const std::string& needle) {
     return false;
 }
 
+std::size_t count_observations(const fs::path& observations, const std::string& needle) {
+    std::size_t count = 0;
+    for (const std::string& line : lines_of(observations)) {
+        if (line.find(needle) != std::string::npos) {
+            ++count;
+        }
+    }
+    return count;
+}
+
 // The bot channel is only opened for an instance the runner prepared.
 fs::path prepare_instance(const fs::path& run_dir, const std::string& instance) {
     const fs::path bot = run_dir / instance / "bot";
@@ -158,6 +168,14 @@ std::string result_value(const fs::path& run_dir, const std::string& instance, c
     return std::string();
 }
 
+// One more `key=1|0` line of the result file (the fixed table above stays small,
+// while a check added later does not have to renumber the arguments).
+void append_result(const fs::path& run_dir, const std::string& instance, const char* key,
+                   bool value) {
+    std::ofstream output(run_dir / instance / "result", std::ios::binary | std::ios::app);
+    output << key << '=' << (value ? 1 : 0) << '\n';
+}
+
 // Observations appended after `from` (0-based line index): used to prove that a
 // client still sees its state *after* the reconnect, not only before it.
 bool has_observation_from(const fs::path& observations, std::size_t from,
@@ -186,18 +204,20 @@ int run_host(const fs::path& run_dir) {
     }
 
     const fs::path observations = bot / "observations.jsonl";
-    // The client writes this marker when its scenario (pickup, weather, reconnect
-    // both ways) is done: the host must stay up for all of it.
+    // The client writes this marker when its scenario (pickup, weather, move,
+    // drop, reconnect both ways) is done: the host must stay up for all of it.
     const fs::path done = run_dir / "client-1" / "done";
     bool pickup = false;
+    bool drop = false;
     unsigned max_peers = 0;
     for (int elapsed = 0; elapsed < kHostBudgetMs; elapsed += kTickSleepMs) {
         runtime.tick();
         std::this_thread::sleep_for(std::chrono::milliseconds(kTickSleepMs));
         max_peers = std::max(max_peers, runtime.status().peers);
         if (elapsed % (kTickSleepMs * 5) == 0) {
-            // The client's pickup intent must have been applied by the authority.
+            // The client's pickup/drop intents must have been applied by the authority.
             pickup = pickup || has_observation(observations, "\"event\":\"pickup\"");
+            drop = drop || has_observation(observations, "\"event\":\"drop\"");
         }
         if (fs::exists(done)) {
             // Let the last verdicts/events reach the client before the session ends.
@@ -212,6 +232,7 @@ int run_host(const fs::path& run_dir) {
     runtime.shutdown();
     write_result(run_dir, "host", pickup, false, false, status.transport, max_peers,
                  status.joined);
+    append_result(run_dir, "host", "drop", drop);
     if (!pickup) {
         std::cout << "host: pickup=" << pickup << " peers=" << max_peers
                   << " transport=" << status.transport << "\n";
@@ -246,6 +267,12 @@ int run_client(const fs::path& run_dir) {
     bool rejoin_acked = false;
     bool expired_acked = false;
     bool joined_after_rejoin = false;
+    bool moved = false;
+    bool dropped = false;
+    bool move_sent = false;
+    bool drop_sent = false;
+    bool repick_sent = false;
+    bool repicked = false;
     std::size_t rejoin_index = 0;
 
     for (int elapsed = 0; elapsed < kClientBudgetMs; elapsed += kTickSleepMs) {
@@ -276,14 +303,50 @@ int run_client(const fs::path& run_dir) {
             }
         }
 
-        // Step 3: the host drops this peer's link; the client must recover the
+        // Step 3: F1-01 movement. The intent travels to the host, which moves the
+        // actor record of this peer's slot; the new position is only observable
+        // through the mirror.
+        if (!move_sent && pickup_acked && weather_acked && inventory && weather) {
+            push_action(bot, 3,
+                        "\"type\":\"move_to\",\"target\":\"waypoint\","
+                        "\"pos\":{\"x\":12,\"y\":0,\"z\":4}");
+            move_sent = true;
+        }
+        if (move_sent && !moved) {
+            for (const std::string& line : lines_of(observations)) {
+                if (line.find("\"kind\":\"state\"") != std::string::npos &&
+                    line.find("\"actor\":{") != std::string::npos &&
+                    line.find("\"pos\":[12,0,4]") != std::string::npos) {
+                    moved = true;
+                    break;
+                }
+            }
+        }
+
+        // Step 4: F1-02 drop. The same item entity goes back into the world (no
+        // duplicate) and leaves this player's inventory.
+        if (moved && !drop_sent) {
+            push_action(bot, 4, "\"type\":\"drop\",\"item\":\"bread\"");
+            drop_sent = true;
+        }
+        dropped = dropped || has_observation(observations, "\"event\":\"drop\"");
+
+        // Step 5: pick the dropped item up again, so the inventory of the resumed
+        // character has something to keep across the reconnect (F1-10).
+        if (dropped && !repick_sent) {
+            push_action(bot, 5, "\"type\":\"pickup\",\"item\":\"bread\"");
+            repick_sent = true;
+        }
+        repicked = repicked || count_observations(observations, "\"event\":\"pickup\"") >= 2;
+
+        // Step 6: the host drops this peer's link; the client must recover the
         // session on its own and be resumed inside the window (F1-10).
-        if (!rejoin_sent && pickup_acked && weather_acked && inventory && weather) {
-            push_action(bot, 3, "\"type\":\"send\",\"command\":\"debug.reconnect window=ok\"");
+        if (repicked && !rejoin_sent) {
+            push_action(bot, 6, "\"type\":\"send\",\"command\":\"debug.reconnect window=ok\"");
             rejoin_sent = true;
         }
         if (rejoin_sent) {
-            rejoin_acked = rejoin_acked || fs::exists(outbox / "0003.json");
+            rejoin_acked = rejoin_acked || fs::exists(outbox / "0006.json");
             if (!rejoin) {
                 rejoin = has_observation(observations, "\"event\":\"player_rejoin\"");
                 if (rejoin) {
@@ -299,14 +362,14 @@ int run_client(const fs::path& run_dir) {
             }
         }
 
-        // Step 4: the same drop, but the host closes the window at once: the
+        // Step 7: the same drop, but the host closes the window at once: the
         // return is an explicit "window expired" with a new character.
         if (rejoin && rejoin_acked && !expired_sent) {
-            push_action(bot, 4, "\"type\":\"send\",\"command\":\"debug.reconnect window=expired\"");
+            push_action(bot, 7, "\"type\":\"send\",\"command\":\"debug.reconnect window=expired\"");
             expired_sent = true;
         }
         if (expired_sent) {
-            expired_acked = expired_acked || fs::exists(outbox / "0004.json");
+            expired_acked = expired_acked || fs::exists(outbox / "0007.json");
             expired = expired || has_observation(observations, "\"event\":\"window_expired\"");
         }
         if (expired && expired_acked && inventory_after_rejoin) {
@@ -319,6 +382,11 @@ int run_client(const fs::path& run_dir) {
     runtime.shutdown();
     write_result(run_dir, "client-1", pickup, expired_acked, inventory, status.transport,
                  status.peers, joined_after_rejoin || status.joined);
+    append_result(run_dir, "client-1", "moved", moved);
+    append_result(run_dir, "client-1", "move_ack", fs::exists(outbox / "0003.json"));
+    append_result(run_dir, "client-1", "dropped", dropped);
+    append_result(run_dir, "client-1", "drop_ack", fs::exists(outbox / "0004.json"));
+    append_result(run_dir, "client-1", "repick", repicked);
     if (!pickup || !expired_acked || !inventory) {
         std::cout << "client: joined=" << status.joined << " pickup=" << pickup
                   << " expired_ack=" << expired_acked << " inventory=" << inventory
@@ -326,10 +394,12 @@ int run_client(const fs::path& run_dir) {
         return 1;
     }
     if (!weather || !rejoin || !inventory_after_rejoin || !expired || !rejoin_acked ||
-        !joined_after_rejoin) {
+        !joined_after_rejoin || !moved || !dropped || !repicked) {
         std::cout << "client: weather=" << weather << " rejoin=" << rejoin
                   << " rejoin_ack=" << rejoin_acked << " inventory_after=" << inventory_after_rejoin
-                  << " expired=" << expired << " joined_after=" << joined_after_rejoin << "\n";
+                  << " expired=" << expired << " joined_after=" << joined_after_rejoin
+                  << " moved=" << moved << " dropped=" << dropped << " repick=" << repicked
+                  << " transport=" << status.transport << "\n";
         return 1;
     }
     return 0;
@@ -429,6 +499,15 @@ int run_driver(const fs::path& run_dir) {
     check(result_flag(run_dir, "host", "pickup"), "host applied the client's intent");
     check(result_value(run_dir, "host", "peers") == "2",
           "host saw the client's player row in the session");
+
+    // F1-01/F1-02 over the network: the host applied the client's movement and drop
+    // intents, and the client saw the results through mirrored snapshots only.
+    check(result_flag(run_dir, "client-1", "move_ack"), "client got its move verdict over UDP");
+    check(result_flag(run_dir, "client-1", "moved"),
+          "the client sees its own character at the waypoint");
+    check(result_flag(run_dir, "client-1", "drop_ack"), "client got its drop verdict over UDP");
+    check(result_flag(run_dir, "client-1", "dropped"), "the client observed the item drop");
+    check(result_flag(run_dir, "host", "drop"), "host applied the client's drop");
 
     // F0-02 event fan-out: the world events the host publishes reach the client
     // bot (`observer = peer` over the network, not only in-process).

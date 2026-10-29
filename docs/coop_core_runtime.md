@@ -27,6 +27,7 @@ CLevel::OnFrame
 | События мира в наблюдения ботов | `coop_bot_channel` из `ccop_core_runtime` (`weather`, `emission_start`, `emission_end`, `time_sync`, `player_rejoin`, `window_expired`, `join_rejected`); хост рассылает их клиентам (`coop.obs.event`), поэтому `observer = peer` выполняется и по сети | `tests/cpp/coop/run_core.sh` |
 | Артефакт F0-07 | `EventLog::write_jsonl` → `<run-dir>/<instance>.jsonl`, `obs::Metrics` → `<instance>.metrics.json` | `obs::read_jsonl` в тесте + `xrn_core_runlog merge` |
 | Интенты ботов в `HostSession` + ack | `coop_bot_channel` (inbox) → `ClientSession::bridge()` → `HostSession` → вердикт → `outbox` + `observations.jsonl` | `tests/cpp/coop/run_core.sh` (подбор `bread` получает вердикт хоста) |
+| Движение и выброс предмета игрока (F1-01/F1-02) | `coop.move.intent` → `ActorReplicator::move` (позиция/анимация актора) и `coop.drop.intent` → `InventoryAuthority::drop`; дельты актора уходят в Lua-слой (`actor::publish_actor_events`) и всем клиентам снапшотами | `tests/cpp/coop/run_core.sh` (in-process `move_to`/`drop` + кросс-процессные интенты по UDP), `tests/unit/core/test_actor.cpp`, `test_inventory.cpp` |
 
 ## 2. Включение: только harness-профиль
 
@@ -127,15 +128,35 @@ CTransport (coop/coop_transport.*)          xnt C ABI (src/transport/include/xnt
 
 | Команда | Что делает | Событие наблюдений |
 |---|---|---|
-| `debug.weather [type=fog]` | прокручивает цикл погоды хоста на один шаг (≥ одного dwell) | `weather` (виден всем) |
-| `debug.emission start` | `EnvironmentAuthority::trigger_emission()` | `emission_start` (виден всем) |
+| `debug.weather [type=fog]` | `EnvironmentAuthority::force_weather_step()`: следующий шаг цикла погоды наступает сразу, тренд переякоривается от текущего мирового времени; мировые часы **не** двигаются (иначе это был бы ещё один `time_sync`) | `weather` (виден всем) |
+| `debug.emission start` | `EnvironmentAuthority::trigger_emission()` | `emission_start` — ровно один раз на цикл, на границе `Start` (фаза `Warn` — это сирена того же цикла и остаётся только в логе F0-07); `emission_end` на `End` (виден всем) |
 | `debug.clock sync` | `set_world_time(+1 игровая минута)` | `time_sync` (виден всем) |
 | `debug.reconnect window=ok` | рвёт линк пира, который послал команду, и держит его слот в окне реконнекта: возврат внутри окна — тот же персонаж (`HostSession::drop_peer(KeepSlot)`); в in-process профиле отбрасывается loopback-пир | `player_rejoin` |
 | `debug.reconnect window=expired` | то же, но окно закрывается сразу (600 мс в debug-профиле): слот свободен, персонаж уходит, возврат — явный `window_expired` (`drop_peer(CloseWindow)`) | `window_expired` |
 
-`debug.cfg_probe` и `debug.level_change` пока **не** реализованы: адаптер
-отвечает `done`, но публикует `debug_unsupported` с причиной, чтобы сценарий
-e2e падал на ассерте события, а не «зеленел» молча.
+### 4.1. Интенты игрока: движение (F1-01) и выброс предмета (F1-02)
+
+Действия бота `move_to`/`teleport` и `drop` — это **интенты**, а не запись
+состояния (NFR-ARCH-1). Клиент кладёт запрос в свой бридж-канал, хост находит
+слот отправителя в сессии (`HostSession::slot_of`) и применяет его через
+`ActorReplicator::move` / `InventoryAuthority::drop`; вердикт уходит только
+отправителю, и бот отвечает `done` лишь когда хост принял действие.
+
+| Интент | Канал | Что делает хост | Наблюдения |
+|---|---|---|---|
+| `move_to target=<имя> pos={x,y,z}` | `coop.move.intent` → `coop.move.ack` | `ActorReplicator::move(slot, pos, yaw)` + анимация `Run` на один такт (200 мс), затем `Idle`; дельты актора уходят в Lua-слой (`actor`) и всем клиентам | `move` (у применившего и на хосте), `move_rejected` + `failed` при отказе |
+| `drop item=<class>` | `coop.drop.intent` → `coop.drop.ack` | `InventoryAuthority::drop(slot, player_id, entity, позиция персонажа)`: тот же entity возвращается в мир (дубля нет) | `drop` (у отправителя и на хосте), `drop_rejected` + `failed` при отказе |
+
+Позиция в интенте — единственное, что приходит от клиента (`x=..;y=..;z=..`,
+`%.9g` — точный round-trip float); вне разумных границ мира интент отвергается.
+`drop` несёт только id entity: класс предмета клиент находит в своём зеркале,
+а «действительно ли этот игрок его держит» решает авторитет.
+
+`debug.cfg_probe` (F0-09) и `debug.level_change` (F1-13) реализованы поверх
+реальных `cfgdiff::Probe`/`Gate` и `level::LevelChangeAuthority` (коммиты
+`f695d647`, `8a499acf`). Отказ механики по-прежнему честный: адаптер публикует
+`debug_unsupported` с причиной, чтобы сценарий e2e падал на ассерте события, а
+не «зеленел» молча.
 
 ## 5. Ограничения (честно)
 

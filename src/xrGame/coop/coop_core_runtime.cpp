@@ -9,6 +9,8 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -88,6 +90,23 @@ constexpr xrn::core::PlayerId kHostLocalPlayerId = xrn::core::kHostPlayerId;
 constexpr const char* kDebugIntentChannel = "coop.debug.intent";
 constexpr const char* kDebugAckChannel = "coop.debug.ack";
 constexpr char kDebugFieldSeparator = '\n';
+// F1-01 (US-1.2): how a client asks the host to move its character. The client
+// sends what the player wants (a waypoint), never a slot or a position of
+// somebody else: the session attributes the intent to the sender (NFR-ARCH-1).
+constexpr const char* kMoveIntentChannel = "coop.move.intent";
+constexpr const char* kMoveAckChannel = "coop.move.ack";
+// F1-02 (US-1.3): a drop is the same kind of intent — the host puts the item of
+// the sender's own inventory back into the world.
+constexpr const char* kDropIntentChannel = "coop.drop.intent";
+constexpr const char* kDropAckChannel = "coop.drop.ack";
+// Fields of an intent payload (`key=value` pairs joined by ';') and of a verdict
+// payload (`value` lines separated by kDebugFieldSeparator, so a free-form detail
+// never has to be escaped).
+constexpr char kIntentFieldSeparator = ';';
+// The run animation is held for one beat after a debug move, so the animation
+// field of the record changes for a remote observer (US-1.2) and then settles to
+// idle: the debug move itself is instantaneous.
+constexpr std::int64_t kMoveAnimationMs = 200;
 // Host -> clients: the session events the host observes for its own bot channel
 // (F0-12) travel to every client on this channel, so a client bot sees the same
 // events as the host (`observer = peer` over the network). Payload: `event=<name>`.
@@ -290,6 +309,88 @@ std::string argument_value(const std::string& argument, const char* key) {
     return argument.substr(start, end == std::string::npos ? std::string::npos : end - start);
 }
 
+// --- intent/verdict payloads (F1-01/F1-02) ---------------------------------
+//
+// Intent (Lua/bot side -> host): `key=value` pairs joined by ';'. Verdict (host
+// -> sender): values on their own lines, so a free-form detail never has to be
+// escaped. Both stay private to this adapter: the core owns the domain types and
+// the session owns the attribution, this is only their carrier over the bridge.
+bool parse_double(const std::string& text, double& out) {
+    if (text.empty()) {
+        return false;
+    }
+    char* end = nullptr;
+    const double parsed = std::strtod(text.c_str(), &end);
+    if (end == nullptr || *end != '\0' || !std::isfinite(parsed)) {
+        return false;
+    }
+    out = parsed;
+    return true;
+}
+
+bool intent_field(const std::string& payload, const char* key, std::string& out) {
+    const std::string prefix = std::string(key) + "=";
+    std::size_t start = 0;
+    while (start <= payload.size()) {
+        const std::size_t end = payload.find(kIntentFieldSeparator, start);
+        const std::string item =
+            payload.substr(start, end == std::string::npos ? std::string::npos : end - start);
+        if (item.rfind(prefix, 0) == 0) {
+            out = item.substr(prefix.size());
+            return true;
+        }
+        if (end == std::string::npos) {
+            break;
+        }
+        start = end + 1;
+    }
+    return false;
+}
+
+bool intent_number(const std::string& payload, const char* key, double& out) {
+    std::string text;
+    return intent_field(payload, key, text) && parse_double(text, out);
+}
+
+// F1-01 intent payload: the point the player wants to stand on. `%.9g` is the
+// shortest text that round-trips a float, so the host applies exactly the point
+// the client named.
+std::string encode_move_intent(const act::Vec3& position) {
+    char buffer[128] = {};
+    std::snprintf(buffer, sizeof(buffer), "x=%.9g;y=%.9g;z=%.9g",
+                  static_cast<double>(position.x), static_cast<double>(position.y),
+                  static_cast<double>(position.z));
+    return buffer;
+}
+
+// Joins the values into the verdict payload (`status` first: it is what every
+// consumer reads before anything else).
+std::string verdict_payload(const std::vector<std::string>& values) {
+    std::string payload;
+    for (std::size_t index = 0; index < values.size(); ++index) {
+        if (index > 0) {
+            payload.push_back(kDebugFieldSeparator);
+        }
+        payload += values[index];
+    }
+    return payload;
+}
+
+std::vector<std::string> split_verdict(const std::string& payload) {
+    std::vector<std::string> values;
+    std::size_t start = 0;
+    while (start <= payload.size()) {
+        const std::size_t end = payload.find(kDebugFieldSeparator, start);
+        values.push_back(
+            payload.substr(start, end == std::string::npos ? std::string::npos : end - start));
+        if (end == std::string::npos) {
+            break;
+        }
+        start = end + 1;
+    }
+    return values;
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -408,6 +509,8 @@ struct CCoreRuntime::SImpl {
 
     // --- run state -----------------------------------------------------------
     std::uint32_t env_sequence = 0;
+    // Sequence of the F1-01 actor deltas on the Lua seam (`actor` channel).
+    std::uint32_t actor_sequence = 0;
     std::uint32_t steps = 0;
     std::int64_t accumulator_ms = 0;
     std::int64_t last_state_ms = 0;
@@ -416,6 +519,19 @@ struct CCoreRuntime::SImpl {
     std::uint32_t next_request = 0;
     std::uint32_t item_sequence = 0;
     bool lua_started = false;
+
+    // F1-01: characters whose debug move is still "running" (the animation settles
+    // to idle after `idle_at_ms`). One entry per slot, never one per frame.
+    struct SActiveMove {
+        rep::WriterSlot slot = rep::kHostWriter;
+        std::int64_t idle_at_ms = 0;
+    };
+    std::vector<SActiveMove> moving;
+
+    // The runner prepares the bot channel *after* the stand is up (a scenario
+    // names its actors only when it runs), so the adapter re-checks the directory
+    // at a modest interval instead of opening it once and never again.
+    std::int64_t channel_probe_at_ms = 0;
 
     // Reconnect scenario (`debug.reconnect`): 0 idle, 1 dropped, 2 returning.
     int reconnect_phase = 0;
@@ -462,12 +578,26 @@ struct CCoreRuntime::SImpl {
         bot::SInboxMessage message;
         std::uint32_t request = 0;
         std::string item;
+        std::string target;
+        std::int64_t started_ms = 0;
         std::int64_t deadline_ms = 0;
-        // A debug command forwarded to the host (network profile); its verdict
-        // arrives on `kDebugAckChannel`, not as a pickup ack.
-        bool debug = false;
+        // The channel the verdict of this action arrives on: empty = the
+        // inventory ack of a pickup (the core's own channel), otherwise one of
+        // the adapter channels (debug / move / drop).
+        std::string verdict_channel;
     };
     std::vector<SPendingAction> pending;
+
+    // The pending action waiting for a verdict on `channel` with this request id.
+    std::optional<std::size_t> pending_index(const std::string& channel,
+                                             std::uint32_t request) const {
+        for (std::size_t index = 0; index < pending.size(); ++index) {
+            if (pending[index].verdict_channel == channel && pending[index].request == request) {
+                return index;
+            }
+        }
+        return std::nullopt;
+    }
 
     xrn::core::BridgeLink* local_bridge() {
         if (host_session != nullptr) {
@@ -680,11 +810,11 @@ struct CCoreRuntime::SImpl {
             break;
         case env::EnvironmentEventKind::Emission:
             log_event.kind = obs::EventKind::Emission;
-            // The start of the cycle and its end are the two boundaries every
-            // observer sees once (AC-1.6.2); the intermediate phases stay in the
-            // F0-07 log only.
-            if (event.emission.transition == env::EmissionTransition::Warn ||
-                event.emission.transition == env::EmissionTransition::Start) {
+            // AC-1.6.2 (QA-F5): one `emission_start` and one `emission_end` per
+            // cycle. The warning is the siren phase *of the same cycle*, so it is
+            // not a second start: it stays in the F0-07 log (and the Lua layer,
+            // which drives the siren, sees the raw transition).
+            if (event.emission.transition == env::EmissionTransition::Start) {
                 channel.observe_event(
                     "emission_start",
                     {{"cycle", bot::SJson::make_number(static_cast<double>(event.emission.cycle))},
@@ -744,6 +874,137 @@ struct CCoreRuntime::SImpl {
             static_cast<void>(
                 inv::publish_item_events(host_session->bridge(), events, item_sequence));
         }
+    }
+
+    // --- F1-01/F1-02: peer intents (movement, item drop) ----------------------
+    //
+    // A character and the items a player holds are host-authoritative. A client
+    // sends what the player *wants* on its own bridge channel; the host resolves
+    // the sender's slot here (never the payload) and applies the core authority.
+    // The verdict answers the sender only, so a bot action is `done` exactly when
+    // the host accepted it (NFR-ARCH-1/5).
+
+    struct SRequester {
+        rep::WriterSlot slot = rep::kHostWriter;
+        xrn::core::PlayerId player = xrn::core::kAnonymousPlayerId;
+    };
+
+    // `peer` is attributed by the session: the intent acts for the sender's own
+    // character, never for a slot or a player id the payload names.
+    bool requester_of(PeerId peer, SRequester& out) const {
+        if (host_session == nullptr) {
+            return false;
+        }
+        const std::optional<rep::WriterSlot> slot = host_session->slot_of(peer);
+        if (!slot.has_value()) {
+            return false;
+        }
+        for (const xrn::core::SessionPlayer& player : host_session->players()) {
+            if (player.slot != slot.value()) {
+                continue;
+            }
+            out.slot = player.slot;
+            out.player = player.player_id;
+            return player.state == xrn::core::PlayerState::Connected &&
+                   player.player_id != xrn::core::kAnonymousPlayerId;
+        }
+        return false;
+    }
+
+    // F1-01: the host moves the character of `slot` to the requested point. The
+    // debug move is instantaneous (the scenario asserts an eventual position), so
+    // the run animation is held for one beat and then settles to idle: a remote
+    // observer sees both the position and the animation change.
+    bool apply_move(rep::WriterSlot slot, const act::Vec3& position, std::string& detail) {
+        if (actors == nullptr) {
+            detail = "no actor authority";
+            return false;
+        }
+        const std::optional<act::ActorView> current = actors->view(slot);
+        const float yaw = current.has_value() ? current->yaw : 0.0F;
+        const CoreError moved = actors->move(slot, position, yaw);
+        if (failed(moved)) {
+            detail = std::string("move refused: ") + xrn::core::to_string(moved);
+            return false;
+        }
+        static_cast<void>(actors->set_animation(slot, act::Animation::Run, 0.0F));
+        const std::int64_t idle_at = epoch_ms() + kMoveAnimationMs;
+        for (SActiveMove& entry : moving) {
+            if (entry.slot == slot) {
+                entry.idle_at_ms = idle_at;
+                return true;
+            }
+        }
+        moving.push_back(SActiveMove{slot, idle_at});
+        return true;
+    }
+
+    // The animation of a moved character settles back to idle once the beat is
+    // over (F1-01: only changes cross the seam, never per-frame state).
+    void service_moves(std::int64_t now) {
+        if (actors == nullptr) {
+            moving.clear();
+            return;
+        }
+        for (std::size_t index = 0; index < moving.size();) {
+            if (now < moving[index].idle_at_ms) {
+                ++index;
+                continue;
+            }
+            static_cast<void>(
+                actors->set_animation(moving[index].slot, act::Animation::Idle, 0.0F));
+            moving.erase(moving.begin() + static_cast<std::ptrdiff_t>(index));
+        }
+    }
+
+    // F1-01 Lua seam: the actor deltas of the authority reach the gameplay layer
+    // on `actor::kBridgeChannel` (the same event-driven path as the items and the
+    // environment, NFR-ARCH-10). Draining the queue here also keeps it bounded.
+    void publish_actor_changes() {
+        if (actors == nullptr) {
+            return;
+        }
+        const std::vector<act::ActorEvent> events = actors->take_events();
+        if (events.empty() || host_session == nullptr) {
+            return;
+        }
+        static_cast<void>(
+            act::publish_actor_events(host_session->bridge(), events, actor_sequence));
+    }
+
+    // F1-02: the host puts an item held by `requester` back into the world at the
+    // character's own position. The item entity is the same one for its whole
+    // life, so a drop can never duplicate it (AC-1.3.1).
+    inv::PickupVerdict apply_drop(const SRequester& requester, rep::EntityId item,
+                                  std::string& detail) {
+        inv::PickupVerdict verdict;
+        verdict.item = item;
+        if (inventory == nullptr) {
+            verdict.status = inv::PickupStatus::InvalidRequest;
+            detail = "no inventory authority";
+            return verdict;
+        }
+        inv::Vec3 position{};
+        bool placed = false;
+        if (actors != nullptr) {
+            const std::optional<act::ActorView> view = actors->view(requester.slot);
+            if (view.has_value()) {
+                position = view->position;
+                placed = true;
+            }
+        }
+        if (!placed) {
+            const std::optional<inv::ItemView> known = inventory->item(item);
+            if (!known.has_value()) {
+                verdict.status = inv::PickupStatus::UnknownItem;
+                detail = "no such item in the world";
+                return verdict;
+            }
+            position = known->position;
+        }
+        verdict = inventory->drop(requester.slot, requester.player, item, position);
+        detail = inv::to_string(verdict.status);
+        return verdict;
     }
 
     // --- connection lifecycle -> observations (F0-08/F1-10/F0-09) -----------
@@ -1103,16 +1364,29 @@ struct CCoreRuntime::SImpl {
         argument = payload.substr(separator + 1);
     }
 
-    // Host: executes the debug intents peers sent and answers them. Everything
-    // else stays in the local bridge for the Lua layer (the queue is drained
+    // Host: executes the intents peers sent and answers them. Everything else
+    // stays in the local bridge for the Lua layer (the queue is drained
     // destructively, so foreign messages are handed over explicitly).
-    void drain_debug_intents() {
+    //
+    // Every intent is a *request*, never a write: the payload names what the
+    // player wants, the host resolves the sender's slot (see `requester_of`) and
+    // answers the sender only. A peer that is not in the session is refused
+    // instead of guessed.
+    void drain_host_intents() {
         if (host_session == nullptr) {
             return;
         }
         std::vector<BridgeMessage> foreign;
         BridgeMessage message;
         while (host_session->bridge().pull_inbound(message)) {
+            if (message.channel == kMoveIntentChannel) {
+                handle_move_intent(message);
+                continue;
+            }
+            if (message.channel == kDropIntentChannel) {
+                handle_drop_intent(message);
+                continue;
+            }
             if (message.channel != kDebugIntentChannel) {
                 foreign.push_back(std::move(message));
                 continue;
@@ -1148,6 +1422,96 @@ struct CCoreRuntime::SImpl {
         for (BridgeMessage& kept : foreign) {
             coop::bridge().enqueue(xrn::core::to_engine<coop::SMessage>(std::move(kept)));
         }
+    }
+
+    // The answer of one intent: the sender only, on the intent's own ack channel.
+    // The host's own bot never sends an intent — its actions are applied directly
+    // in `handle_action` — so every verdict here has a peer to answer.
+    void answer_intent(PeerId peer, const BridgeMessage& request, const char* channel,
+                       const std::vector<std::string>& values) {
+        if (host_session == nullptr) {
+            return;
+        }
+        BridgeMessage ack;
+        ack.seq = request.seq;
+        ack.channel = channel;
+        ack.payload = verdict_payload(values);
+        static_cast<void>(host_session->send_bridge_to(peer, ack));
+    }
+
+    // F1-01 (US-1.2): `x=..;y=..;z=..` -> the character of the sender moves
+    // there. The slot comes from the session; a position outside the world is a
+    // protocol error and changes nothing.
+    void handle_move_intent(const BridgeMessage& message) {
+        const PeerId peer = message.from;
+        SRequester requester;
+        std::string detail;
+        std::string status = "applied";
+        double x = 0.0;
+        double y = 0.0;
+        double z = 0.0;
+        if (!requester_of(peer, requester)) {
+            status = "refused";
+            detail = "the sender has no character in this session";
+        } else if (!intent_number(message.payload, "x", x) ||
+                   !intent_number(message.payload, "y", y) ||
+                   !intent_number(message.payload, "z", z)) {
+            status = "refused";
+            detail = "the intent carries no finite position";
+        } else {
+            const float limit = 100000.0F;
+            if (std::fabs(x) > limit || std::fabs(y) > limit || std::fabs(z) > limit) {
+                status = "refused";
+                detail = "the requested position is outside the world";
+            } else {
+                const act::Vec3 position{static_cast<float>(x), static_cast<float>(y),
+                                         static_cast<float>(z)};
+                if (apply_move(requester.slot, position, detail)) {
+                    channel.observe_event(
+                        "move", {{"x", bot::SJson::make_number(x)},
+                                 {"y", bot::SJson::make_number(y)},
+                                 {"z", bot::SJson::make_number(z)}});
+                    detail = "character moved";
+                } else {
+                    status = "refused";
+                }
+            }
+        }
+        answer_intent(peer, message, kMoveAckChannel, {status, detail});
+    }
+
+    // F1-02 (US-1.3): `item=<entity>` -> the sender's own item goes back into the
+    // world. The entity is resolved by the client from its mirror (the class it
+    // sees), the authority decides whether this player really holds it.
+    void handle_drop_intent(const BridgeMessage& message) {
+        const PeerId peer = message.from;
+        SRequester requester;
+        std::string detail;
+        double raw_item = 0.0;
+        inv::PickupVerdict verdict;
+        if (!requester_of(peer, requester)) {
+            verdict.status = inv::PickupStatus::InvalidRequest;
+            detail = "the sender has no character in this session";
+        } else if (!intent_number(message.payload, "item", raw_item) || raw_item < 1.0) {
+            verdict.status = inv::PickupStatus::InvalidRequest;
+            detail = "the intent carries no item";
+        } else {
+            const rep::EntityId item = static_cast<rep::EntityId>(raw_item);
+            verdict = apply_drop(requester, item, detail);
+        }
+        if (verdict.applied()) {
+            channel.observe_event(
+                "drop", {{"item", bot::SJson::make_string(verdict.item_class)},
+                         {"count", bot::SJson::make_number(static_cast<double>(verdict.count))}});
+        } else {
+            channel.observe_event(
+                "drop_rejected", {{"item", bot::SJson::make_string(verdict.item_class)},
+                                  {"reason", bot::SJson::make_string(
+                                                 std::string(inv::to_string(verdict.status)))}});
+        }
+        answer_intent(peer, message, kDropAckChannel,
+                      {verdict.applied() ? "applied" : "refused", verdict.item_class,
+                       std::to_string(verdict.count), inv::to_string(verdict.status)});
     }
 
     // The verdict is already on the wire, so the peer can answer its bot action
@@ -1223,12 +1587,26 @@ struct CCoreRuntime::SImpl {
     // --- bot actions (F0-12) -------------------------------------------------
     //
     // The scenario names an item class ("bread"), the wire carries ids. A client
-    // has no authoritative inventory: it resolves the class in the world items it
-    // mirrors, exactly like a player picking up what it sees. The host resolves
-    // it in its own authority.
-    rep::EntityId resolve_item(const std::string& item_class) {
+    // has no authoritative inventory: it resolves the class in what it mirrors —
+    // the items on the ground for a pickup, its own inventory for a drop. The host
+    // resolves it in its own authority.
+    rep::EntityId resolve_item(const std::string& item_class, bool held = false) {
         if (inventory != nullptr) {
+            if (held) {
+                for (const inv::ItemView& item : inventory->inventory_of(local_player_id)) {
+                    if (item.item == item_class) {
+                        return item.key.entity;
+                    }
+                }
+            }
             for (const inv::ItemView& item : inventory->world_items()) {
+                if (item.item == item_class) {
+                    return item.key.entity;
+                }
+            }
+        }
+        if (held) {
+            for (const inv::ItemView& item : item_view.inventory()) {
                 if (item.item == item_class) {
                     return item.key.entity;
                 }
@@ -1305,8 +1683,9 @@ struct CCoreRuntime::SImpl {
                 SPendingAction pending_action;
                 pending_action.message = message;
                 pending_action.request = intent.seq;
-                pending_action.debug = true;
+                pending_action.started_ms = started;
                 pending_action.deadline_ms = now + kAckTimeoutMs;
+                pending_action.verdict_channel = kDebugAckChannel;
                 pending.push_back(std::move(pending_action));
                 return;
             }
@@ -1394,18 +1773,120 @@ struct CCoreRuntime::SImpl {
             pending_action.message = message;
             pending_action.request = intent.request;
             pending_action.item = action.item;
+            pending_action.started_ms = started;
             pending_action.deadline_ms = now + kAckTimeoutMs;
             pending.push_back(std::move(pending_action));
             return;
         }
 
         if (action.type == "move_to" || action.type == "teleport") {
-            channel.observe_event("move", {{"item", bot::SJson::make_string(action.target)}});
-            answer(message, "done", started);
+            // F1-01 (US-1.2): a character is host-authoritative. The bot sends
+            // where the player wants to go; the host moves the actor record of the
+            // sender's slot, and every client sees the new position from the
+            // replicated state (never from a local guess).
+            if (!action.has_pos) {
+                answer(message, "failed", started, "move_to needs a target position");
+                return;
+            }
+            const act::Vec3 position{static_cast<float>(action.x), static_cast<float>(action.y),
+                                     static_cast<float>(action.z)};
+            if (peer_session == nullptr && client_session == nullptr) {
+                // The host's own bot (network profile: no loopback peer) acts as
+                // the host row, so its intent is applied right here.
+                std::string detail;
+                if (!apply_move(rep::kHostWriter, position, detail)) {
+                    channel.observe_event("move_rejected",
+                                          {{"reason", bot::SJson::make_string(detail)}});
+                    answer(message, "failed", started, detail);
+                    return;
+                }
+                channel.observe_event("move", {{"target", bot::SJson::make_string(action.target)},
+                                               {"x", bot::SJson::make_number(action.x)},
+                                               {"y", bot::SJson::make_number(action.y)},
+                                               {"z", bot::SJson::make_number(action.z)}});
+                answer(message, "done", started);
+                return;
+            }
+            BridgeMessage intent;
+            intent.seq = ++next_request;
+            intent.channel = kMoveIntentChannel;
+            intent.payload = encode_move_intent(position);
+            xrn::core::BridgeLink* const target_link =
+                peer_session != nullptr ? &peer_session->bridge() : local_bridge();
+            if (target_link == nullptr) {
+                answer(message, "failed", started, "no session for the intent");
+                return;
+            }
+            target_link->on_outbound(intent);
+
+            SPendingAction pending_action;
+            pending_action.message = message;
+            pending_action.request = intent.seq;
+            pending_action.target = action.target;
+            pending_action.started_ms = started;
+            pending_action.deadline_ms = now + kAckTimeoutMs;
+            pending_action.verdict_channel = kMoveAckChannel;
+            pending.push_back(std::move(pending_action));
             return;
         }
-        if (action.type == "drop" || action.type == "equip" || action.type == "use" ||
-            action.type == "pause" || action.type == "resume" || action.type == "respawn") {
+        if (action.type == "drop") {
+            // F1-02 (US-1.3): the same item entity goes back into the world. The
+            // client resolves the class in its own mirrored inventory, the host
+            // decides whether this player really holds it.
+            const rep::EntityId item = resolve_item(action.item, true);
+            if (item == 0) {
+                channel.observe_event("drop_rejected",
+                                      {{"item", bot::SJson::make_string(action.item)},
+                                       {"reason", bot::SJson::make_string("no_item")}});
+                answer(message, "done", started);
+                return;
+            }
+            if (peer_session == nullptr && client_session == nullptr) {
+                SRequester own;
+                own.slot = rep::kHostWriter;
+                own.player = kHostLocalPlayerId;
+                std::string detail;
+                const inv::PickupVerdict verdict = apply_drop(own, item, detail);
+                if (verdict.applied()) {
+                    channel.observe_event(
+                        "drop",
+                        {{"item", bot::SJson::make_string(verdict.item_class)},
+                         {"count", bot::SJson::make_number(static_cast<double>(verdict.count))}});
+                } else {
+                    channel.observe_event(
+                        "drop_rejected",
+                        {{"item", bot::SJson::make_string(verdict.item_class.empty()
+                                                              ? action.item
+                                                              : verdict.item_class)},
+                         {"reason", bot::SJson::make_string(inv::to_string(verdict.status))}});
+                }
+                answer(message, "done", started);
+                return;
+            }
+            BridgeMessage intent;
+            intent.seq = ++next_request;
+            intent.channel = kDropIntentChannel;
+            intent.payload = "item=" + std::to_string(static_cast<unsigned long long>(item));
+            xrn::core::BridgeLink* const target_link =
+                peer_session != nullptr ? &peer_session->bridge() : local_bridge();
+            if (target_link == nullptr) {
+                answer(message, "failed", started, "no session for the intent");
+                return;
+            }
+            target_link->on_outbound(intent);
+
+            SPendingAction pending_action;
+            pending_action.message = message;
+            pending_action.request = intent.seq;
+            pending_action.item = action.item;
+            pending_action.started_ms = started;
+            pending_action.deadline_ms = now + kAckTimeoutMs;
+            pending_action.verdict_channel = kDropAckChannel;
+            pending.push_back(std::move(pending_action));
+            return;
+        }
+        if (action.type == "equip" || action.type == "use" || action.type == "pause" ||
+            action.type == "resume" || action.type == "respawn") {
             channel.observe_event(action.type, {{"item", bot::SJson::make_string(action.item)}});
             answer(message, "done", started);
             return;
@@ -1476,15 +1957,72 @@ struct CCoreRuntime::SImpl {
                 std::string status;
                 std::string detail;
                 split_debug(message.payload, status, detail);
-                for (std::size_t index = 0; index < pending.size(); ++index) {
-                    if (!pending[index].debug || pending[index].request != message.seq) {
-                        continue;
-                    }
-                    answer(pending[index].message, status.c_str(), pending[index].deadline_ms,
-                           detail);
-                    pending.erase(pending.begin() + static_cast<std::ptrdiff_t>(index));
-                    break;
+                const std::optional<std::size_t> found =
+                    pending_index(kDebugAckChannel, message.seq);
+                if (found.has_value()) {
+                    answer(pending[found.value()].message, status.c_str(),
+                           pending[found.value()].started_ms, detail);
+                    pending.erase(pending.begin() + static_cast<std::ptrdiff_t>(found.value()));
                 }
+                continue;
+            }
+            if (message.channel == kMoveAckChannel) {
+                // F1-01: the host applied (or refused) the movement of this
+                // character. The bot action is done only when the host accepted it.
+                const std::optional<std::size_t> found =
+                    pending_index(kMoveAckChannel, message.seq);
+                if (!found.has_value()) {
+                    continue;
+                }
+                const std::vector<std::string> values = split_verdict(message.payload);
+                const std::string status = values.empty() ? "failed" : values.front();
+                const std::string detail = values.size() > 1 ? values[1] : std::string();
+                const SPendingAction waiting = pending[found.value()];
+                if (status == "applied") {
+                    channel.observe_event(
+                        "move", {{"target", bot::SJson::make_string(waiting.target)},
+                                 {"x", bot::SJson::make_number(waiting.message.action.x)},
+                                 {"y", bot::SJson::make_number(waiting.message.action.y)},
+                                 {"z", bot::SJson::make_number(waiting.message.action.z)}});
+                    answer(waiting.message, "done", waiting.started_ms);
+                } else {
+                    channel.observe_event(
+                        "move_rejected", {{"reason", bot::SJson::make_string(detail)}});
+                    answer(waiting.message, "failed", waiting.started_ms, detail);
+                }
+                pending.erase(pending.begin() + static_cast<std::ptrdiff_t>(found.value()));
+                continue;
+            }
+            if (message.channel == kDropAckChannel) {
+                // F1-02: `applied` = the item is back in the world; anything else
+                // is a refusal of the authority (the player does not hold it, ...).
+                const std::optional<std::size_t> found =
+                    pending_index(kDropAckChannel, message.seq);
+                if (!found.has_value()) {
+                    continue;
+                }
+                const std::vector<std::string> values = split_verdict(message.payload);
+                const std::string status = values.empty() ? "failed" : values.front();
+                const SPendingAction waiting = pending[found.value()];
+                const std::string item =
+                    values.size() > 1 && !values[1].empty() ? values[1] : waiting.item;
+                double raw_count = 0.0;
+                const std::int64_t count = values.size() > 2 && parse_double(values[2], raw_count)
+                                               ? static_cast<std::int64_t>(raw_count)
+                                               : 0;
+                const std::string reason = values.size() > 3 ? values[3] : std::string();
+                if (status == "applied") {
+                    channel.observe_event(
+                        "drop", {{"item", bot::SJson::make_string(item)},
+                                 {"count", bot::SJson::make_number(static_cast<double>(count))}});
+                    answer(waiting.message, "done", waiting.started_ms);
+                } else {
+                    channel.observe_event(
+                        "drop_rejected", {{"item", bot::SJson::make_string(item)},
+                                          {"reason", bot::SJson::make_string(reason)}});
+                    answer(waiting.message, "failed", waiting.started_ms, reason);
+                }
+                pending.erase(pending.begin() + static_cast<std::ptrdiff_t>(found.value()));
                 continue;
             }
             if (message.channel != inv::kAckChannel) {
@@ -1496,28 +2034,27 @@ struct CCoreRuntime::SImpl {
             if (failed(inv::decode_pickup_ack(message.payload, verdict))) {
                 continue;
             }
-            for (std::size_t index = 0; index < pending.size(); ++index) {
-                if (pending[index].debug || pending[index].request != verdict.request) {
-                    continue;
-                }
-                if (verdict.applied()) {
-                    channel.observe_event(
-                        "pickup",
-                        {{"item", bot::SJson::make_string(verdict.item_class)},
-                         {"count", bot::SJson::make_number(static_cast<double>(verdict.count))}});
-                    answer(pending[index].message, "done", pending[index].deadline_ms);
-                } else {
-                    channel.observe_event(
-                        "pickup_rejected",
-                        {{"item",
-                          bot::SJson::make_string(verdict.item_class.empty() ? pending[index].item
-                                                                             : verdict.item_class)},
-                         {"reason", bot::SJson::make_string(inv::to_string(verdict.status))}});
-                    answer(pending[index].message, "done", pending[index].deadline_ms);
-                }
-                pending.erase(pending.begin() + static_cast<std::ptrdiff_t>(index));
-                break;
+            const std::optional<std::size_t> found =
+                pending_index(std::string(), verdict.request);
+            if (!found.has_value()) {
+                continue;
             }
+            if (verdict.applied()) {
+                channel.observe_event(
+                    "pickup",
+                    {{"item", bot::SJson::make_string(verdict.item_class)},
+                     {"count", bot::SJson::make_number(static_cast<double>(verdict.count))}});
+                answer(pending[found.value()].message, "done", pending[found.value()].started_ms);
+            } else {
+                channel.observe_event(
+                    "pickup_rejected",
+                    {{"item", bot::SJson::make_string(verdict.item_class.empty()
+                                                          ? pending[found.value()].item
+                                                          : verdict.item_class)},
+                     {"reason", bot::SJson::make_string(inv::to_string(verdict.status))}});
+                answer(pending[found.value()].message, "done", pending[found.value()].started_ms);
+            }
+            pending.erase(pending.begin() + static_cast<std::ptrdiff_t>(found.value()));
         }
     }
 
@@ -1956,9 +2493,9 @@ void CCoreRuntime::tick() {
             }
             if (impl.host_session != nullptr) {
                 impl.host_session->service();
-                // F0-02: a client's debug intent is executed before the publish
-                // of this step, so its effect leaves in the same delta.
-                impl.drain_debug_intents();
+                // F0-02: a peer's intent is executed before the publish of this
+                // step, so its effect leaves in the same delta.
+                impl.drain_host_intents();
             }
             if (impl.environment != nullptr && impl.host_session != nullptr) {
                 static_cast<void>(impl.environment->advance_real_ms(kStepMs));
@@ -1980,6 +2517,10 @@ void CCoreRuntime::tick() {
                 // group move is observed in the same step it happened.
                 impl.observe_level_events();
             }
+            // F1-01: the run animation of a debug move settles to idle after its
+            // beat, and the actor deltas reach the Lua layer.
+            impl.service_moves(now);
+            impl.publish_actor_changes();
             impl.observe_item_events();
             impl.observe_session_deltas();
             impl.step_reconnect_cycle(now);
@@ -2003,6 +2544,19 @@ void CCoreRuntime::tick() {
 
     // Core -> Lua (F0-05): event-driven dispatch only.
     static_cast<void>(coop::bridge().pump());
+
+    // F0-12: the runner prepares `<run-dir>/<instance>/bot` when it starts a
+    // scenario, which is after the stand was healthchecked; open the channel as
+    // soon as it appears (bounded probe, never a stat per frame).
+    if (!impl.channel.ready() && now - impl.channel_probe_at_ms >= 500) {
+        impl.channel_probe_at_ms = now;
+        std::error_code code;
+        if (fs::exists(fs::path(impl.run_dir) / impl.instance / "bot", code)) {
+            if (!impl.channel.open(impl.run_dir, impl.instance)) {
+                impl.note_error("bot channel: " + impl.channel.error());
+            }
+        }
+    }
 
     bot::SInboxMessage message;
     while (impl.channel.ready() && impl.channel.poll(message)) {
@@ -2032,10 +2586,15 @@ bool CCoreRuntime::command(const std::string& name, const std::string& argument,
             detail = "weather is host-authoritative";
             return false;
         }
-        // A debug run does not wait out a 15..40 game-minute dwell: skipping a
-        // whole dwell guarantees at least one weather step (AC-1.6.1).
-        static_cast<void>(impl.environment->advance_game_ms(45 * env::kMsPerMinute));
-        detail = "weather cycle advanced";
+        // A debug run does not wait out a 15..40 game-minute dwell: the next
+        // weather step is forced now, without moving the world clock (a skipped
+        // clock interval would be a `time_sync` of its own, AC-1.6.3).
+        const CoreError result = impl.environment->force_weather_step();
+        if (failed(result)) {
+            detail = "the weather step was refused";
+            return false;
+        }
+        detail = "weather step forced";
         return true;
     }
     if (name == "debug.emission") {
