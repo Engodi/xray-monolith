@@ -116,6 +116,35 @@ else
 fi
 clear_env
 
+# ---------------------------------------------------------------------------
+# F0-05: headless keeps the simulation (AI space + script engine); only the
+# legacy dedicated server runs without it.
+# ---------------------------------------------------------------------------
+ai_work="$work/ai"
+mkdir -p "$ai_work/xrCore" "$ai_work/xrEngine"
+cp "$source_file" "$ai_work/xrCore/headless.cpp"
+cp "$header_file" "$ai_work/xrCore/headless.h"
+cp "$here/stub/stdafx.h" "$ai_work/xrCore/stdafx.h"
+cp "$root/src/xrEngine/ai_simulation.h" "$ai_work/xrEngine/ai_simulation.h"
+
+"$cxx" -std=c++17 -Wall -Wextra -Werror -DENGINE_API= -I"$ai_work" \
+    "$here/test_ai_simulation.cpp" "$ai_work/xrCore/headless.cpp" -o "$ai_work/ai_simulation_test"
+
+ai_check() { # name launch dedicated expected
+    if "$ai_work/ai_simulation_test" "$2" "$3" "$4" >/dev/null; then
+        echo "PASS  $1"
+    else
+        echo "FAIL  $1"
+        fail=1
+    fi
+}
+
+ai_check "normal game keeps simulation"        ""                  0 1
+ai_check "dedicated server has no simulation"  ""                  1 0
+ai_check "headless server keeps simulation"    "-headless_server"  1 1
+ai_check "headless client keeps simulation"    "-headless_client"  1 1
+ai_check "headless without dedicated flag"     "-headless_server"  0 1
+
 if [[ "$fail" -ne 0 ]]; then
     echo "headless flag checks: FAILED" >&2
     exit 1

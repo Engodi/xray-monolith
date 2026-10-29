@@ -1,4 +1,5 @@
 #include "pch_script.h"
+#include "../xrEngine/ai_simulation.h"
 #include "xrServer_Objects_ALife_All.h"
 #include "level.h"
 #include "game_cl_base.h"
@@ -118,7 +119,7 @@ void CLevel::g_sv_Spawn(CSE_Abstract* E)
 	if (0 == O || (!O->net_Spawn(E)))
 	{
 		O->net_Destroy();
-		if (!g_dedicated_server)
+		if (ai_simulation_enabled())
 			client_spawn_manager().clear(O->ID());
 		Objects.Destroy(O);
 		Msg("! Failed to spawn entity '%s'", *E->s_name);
@@ -131,7 +132,7 @@ void CLevel::g_sv_Spawn(CSE_Abstract* E)
 #ifdef DEBUG_MEMORY_MANAGER
 		mem_alloc_gather_stats	(!!psAI_Flags.test(aiDebugOnFrameAllocs));
 #endif // DEBUG_MEMORY_MANAGER
-		if (!g_dedicated_server)
+		if (ai_simulation_enabled())
 			client_spawn_manager().callback(O);
 		//Msg			("--spawn--SPAWN: %f ms",1000.f*T.GetAsync());
 

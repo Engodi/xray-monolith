@@ -62,6 +62,7 @@
 
 #include "alife_simulator.h"
 #include "alife_object_registry.h"
+#include "../xrEngine/ai_simulation.h"
 
 #ifdef DEBUG
 #include "level_debug.h"
@@ -243,19 +244,23 @@ CLevel::CLevel() :
     eEnvironment = Engine.Event.Handler_Attach("LEVEL:Environment", this);
     eEntitySpawn = Engine.Event.Handler_Attach("LEVEL:spawn", this);
     m_pBulletManager = xr_new<CBulletManager>();
-    if (!g_dedicated_server)
+    // F0-05: simulation state. A headless host runs a full game (AI, scripts,
+    // patrol paths, restrictions, delayed spawns), so these managers must exist
+    // even though the process has no GPU, audio, UI or local actor.
+    if (ai_simulation_enabled())
     {
         m_map_manager = xr_new<CMapManager>();
         m_game_task_manager = xr_new<CGameTaskManager>();
-    }
-    m_dwDeltaUpdate = u32(fixed_step * 1000);
-    m_seniority_hierarchy_holder = xr_new<CSeniorityHierarchyHolder>();
-    if (!g_dedicated_server)
-    {
-        m_level_sound_manager = xr_new<CLevelSoundManager>();
         m_space_restriction_manager = xr_new<CSpaceRestrictionManager>();
         m_client_spawn_manager = xr_new<CClientSpawnManager>();
         m_autosave_manager = xr_new<CAutosaveManager>();
+    }
+    m_dwDeltaUpdate = u32(fixed_step * 1000);
+    m_seniority_hierarchy_holder = xr_new<CSeniorityHierarchyHolder>();
+    // Presentation-only managers: audio output and debug drawing.
+    if (!g_dedicated_server)
+    {
+        m_level_sound_manager = xr_new<CLevelSoundManager>();
         m_debug_renderer = xr_new<CDebugRenderer>();
 #ifdef DEBUG
         m_level_debug = xr_new<CLevelDebug>();
@@ -328,7 +333,7 @@ CLevel::~CLevel()
 	xr_delete(m_autosave_manager);
     xr_delete(m_debug_renderer);
     delete_data(m_debug_render_queue);
-    if (!g_dedicated_server)
+    if (ai_simulation_enabled())
         ai().script_engine().remove_script_process(ScriptEngine::eScriptProcessorLevel);
     xr_delete(game);
     xr_delete(game_events);
@@ -1041,7 +1046,7 @@ void CLevel::OnFrame()
 
 	if (m_bNeed_CrPr)
 		make_NetCorrectionPrediction();
-	if (!g_dedicated_server)
+	if (ai_simulation_enabled())
 	{
 		// the map update may run on the parallel thread so removals are reported to script from here
 		MapManager().FlushRemovedNotify();
@@ -1151,7 +1156,7 @@ void CLevel::OnFrame()
 #endif
 	g_pGamePersistent->Environment().SetGameTime(GetEnvironmentGameDayTimeSec(),
 	                                             game->GetEnvironmentGameTimeFactor());
-	if (!g_dedicated_server)
+	if (ai_simulation_enabled())
 		ai().script_engine().script_process(ScriptEngine::eScriptProcessorLevel)->update();
 	m_ph_commander->update();
 	m_ph_commander_scripts->update();
@@ -1171,7 +1176,7 @@ void CLevel::OnFrame()
 	}
 
 	// defer LUA-GC-STEP
-	if (!g_dedicated_server)
+	if (ai_simulation_enabled())
 	{
 		if (g_mt_config.test(mtLUA_GC))
 			Device.seqParallel.push_back(fastdelegate::FastDelegate0<>(this, &CLevel::script_gc));

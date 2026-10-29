@@ -21,7 +21,7 @@
 #include "../xrNetServer/NET_AuthCheck.h"
 
 #include "../xrphysics/physicscommon.h"
-extern ENGINE_API bool g_dedicated_server;
+#include "../xrEngine/ai_simulation.h"
 
 const int max_objects_size = 2 * 1024;
 const int max_objects_size_in_save = 8 * 1024;
@@ -75,13 +75,13 @@ void CLevel::remove_objects()
 	ph_commander().clear();
 	ph_commander_scripts().clear();
 
-	if (!g_dedicated_server)
+	if (ai_simulation_enabled())
 		space_restriction_manager().clear();
 
 	psDeviceFlags.set(rsDisableObjectsAsCrows, b_stored);
 	g_b_ClearGameCaptions = true;
 
-	if (!g_dedicated_server)
+	if (ai_simulation_enabled())
 		ai().script_engine().collect_all_garbage();
 
 	stalker_animation_data_storage().clear();
@@ -92,11 +92,11 @@ void CLevel::remove_objects()
 	Render->clear_static_wallmarks();
 
 #ifdef DEBUG
-	if(!g_dedicated_server)
+	if(ai_simulation_enabled())
 		if (!client_spawn_manager().registry().empty())
 			client_spawn_manager().dump				();
 #endif // DEBUG
-	if (!g_dedicated_server)
+	if (ai_simulation_enabled())
 	{
 #ifdef DEBUG
 		VERIFY(client_spawn_manager().registry().empty());
@@ -167,7 +167,7 @@ void CLevel::net_Stop()
     Device.LuaGC.clear();
     Device.LuaGCDebug.clear();
 
-	if (!g_dedicated_server)
+	if (ai_simulation_enabled())
 		ai().script_engine().collect_all_garbage();
 
 #ifdef DEBUG

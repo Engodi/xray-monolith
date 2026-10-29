@@ -95,8 +95,17 @@ u32 lua_pump() { return static_cast<u32>(coop::bridge().pump()); }
 
 void lua_enable_dispatch() {
     coop::bridge().set_dispatch([](const coop::SMessage& message) {
+        // F0-05: only a dedicated server runs without a script engine (headless
+        // always has one). Never dereference the AI space blindly: keep the
+        // message for a later pull instead.
+        CScriptEngine* engine = ai().get_script_engine();
+        if (!engine) {
+            coop::bridge().enqueue(message);
+            return;
+        }
+
         ::luabind::functor<void> handler;
-        if (!ai().script_engine().functor("coop_sync.on_inbound", handler)) {
+        if (!engine->functor("coop_sync.on_inbound", handler)) {
             // Scripts are not loaded yet (menu) or the coop layer is absent:
             // keep the message for a later pull instead of dropping it.
             coop::bridge().enqueue(message);
@@ -113,7 +122,7 @@ void lua_enable_dispatch() {
             handler(message.channel.c_str(), message.payload.c_str(), message.seq);
         } catch (::luabind::error& error) {
             if (error.state())
-                ai().script_engine().print_output(error.state(), "", LUA_ERRRUN);
+                engine->print_output(error.state(), "", LUA_ERRRUN);
         }
 #else   // LUABIND_NO_EXCEPTIONS
         handler(message.channel.c_str(), message.payload.c_str(), message.seq);

@@ -27,6 +27,7 @@
 #include "ui/UIProgressShape.h"
 #include "ui/UIXmlInit.h"
 #include "physicsshellholder.h"
+#include "../xrEngine/ai_simulation.h"
 
 CUIProgressShape* g_MissileForceShape = NULL;
 
@@ -182,7 +183,7 @@ void CMissile::spawn_fake_missile()
 		CSE_Abstract* object = Level().spawn_item(
 			*cNameSect(),
 			Position(),
-			(g_dedicated_server) ? u32(-1) : ai_location().level_vertex_id(),
+			ai_simulation_enabled() ? ai_location().level_vertex_id() : u32(-1),
 			ID(),
 			true
 		);

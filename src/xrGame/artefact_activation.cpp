@@ -22,6 +22,7 @@
 #include "../xrphysics/iphworld.h"
 #include "restriction_space.h"
 #include "../xrEngine/IGame_Persistent.h"
+#include "../xrEngine/ai_simulation.h"
 
 SArtefactActivation::SArtefactActivation(CArtefact* af, u32 owner_id)
 {
@@ -186,7 +187,7 @@ void SArtefactActivation::SpawnAnomaly()
 	m_af->Center(pos);
 	CSE_Abstract* object = Level().spawn_item(zone_sect,
 	                                          pos,
-	                                          (g_dedicated_server) ? u32(-1) : m_af->ai_location().level_vertex_id(),
+	                                          ai_simulation_enabled() ? m_af->ai_location().level_vertex_id() : u32(-1),
 	                                          0xffff,
 	                                          true
 	);

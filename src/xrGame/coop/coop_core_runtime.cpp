@@ -2457,11 +2457,14 @@ void CCoreRuntime::tick() {
     }
 
     // F0-05: the gameplay Lua layer is started once, when the level is up.
-    // Afterwards it only receives events (NFR-ARCH-10).
+    // Afterwards it only receives events (NFR-ARCH-10). A dedicated server has
+    // no script engine at all; a headless process always has one, so the bridge
+    // must go through get_script_engine() instead of dereferencing the AI space.
     if (!impl.lua_started) {
         impl.lua_started = true;
+        CScriptEngine* engine = ai().get_script_engine();
         ::luabind::functor<void> bootstrap;
-        if (ai().script_engine().functor("coop_core.on_game_start", bootstrap)) {
+        if (engine && engine->functor("coop_core.on_game_start", bootstrap)) {
             // release builds are compiled without exceptions (`xrCore.h`:
             // `LUABIND_NO_EXCEPTIONS`), so `luabind::error` does not exist and
             // the pcall callback reports a failing call instead of throwing.

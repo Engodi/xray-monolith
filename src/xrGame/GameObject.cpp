@@ -4,6 +4,7 @@
 #include "../Include/xrRender/RenderVisual.h"
 #include "../xrphysics/PhysicsShell.h"
 #include "ai_space.h"
+#include "../xrEngine/ai_simulation.h"
 #include "CustomMonster.h"
 #include "physicobject.h"
 #include "HangingLamp.h"
@@ -57,7 +58,7 @@ CGameObject::CGameObject()
 	m_bCrPr_Activated = false;
 	m_dwCrPr_ActivationStep = 0;
 	m_spawn_time = 0;
-	m_ai_location = !g_dedicated_server ? xr_new<CAI_ObjectLocation>() : 0;
+	m_ai_location = ai_simulation_enabled() ? xr_new<CAI_ObjectLocation>() : 0;
 	m_server_flags.one();
 
 	m_callbacks = xr_new<CALLBACK_MAP>();
@@ -99,7 +100,7 @@ void CGameObject::Load(LPCSTR section)
 void CGameObject::reinit()
 {
 	m_visual_callback.clear();
-	if (!g_dedicated_server)
+	if (ai_simulation_enabled())
 		ai_location().reinit();
 
 	// clear callbacks	
@@ -385,11 +386,11 @@ BOOL CGameObject::net_Spawn(CSE_Abstract* DC)
 	}
 
 	reload(*cNameSect());
-	if (!g_dedicated_server)
+	if (ai_simulation_enabled())
 		CScriptBinder::reload(*cNameSect());
 
 	reinit();
-	if (!g_dedicated_server)
+	if (ai_simulation_enabled())
 		CScriptBinder::reinit();
 #ifdef DEBUG
 	if(ph_dbg_draw_mask1.test(ph_m1_DbgTrackObject)&&stricmp(PH_DBG_ObjectTrackName(),*cName())==0)
@@ -1088,7 +1089,7 @@ void CGameObject::shedule_Update(u32 dt)
 	// Msg							("-SUB-:[%x][%s] CGameObject::shedule_Update",smart_cast<void*>(this),*cName());
 	inherited::shedule_Update(dt);
 
-	if (!g_dedicated_server)
+	if (ai_simulation_enabled())
 		CScriptBinder::shedule_Update(dt);
 }
 

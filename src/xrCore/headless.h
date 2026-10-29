@@ -63,6 +63,12 @@ bool SoundEnabled();
 bool UiEnabled();
 bool LocalActorEnabled();
 
+// Simulation gate: true in every headless profile (F0-05). The AI space and the
+// Lua script engine are part of the simulation, not of the presentation layer,
+// so a headless process builds them while a dedicated server (`g_dedicated_server`
+// without a headless profile) does not - see xrEngine/ai_simulation.h.
+bool SimulationEnabled();
+
 // Fixed simulation step of the headless loop (no vsync, no frame limiter).
 unsigned TickRateHz();
 

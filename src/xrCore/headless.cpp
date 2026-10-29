@@ -361,6 +361,8 @@ bool UiEnabled() { return !Active(); }
 
 bool LocalActorEnabled() { return !Active(); }
 
+bool SimulationEnabled() { return Active(); }
+
 unsigned TickRateHz() { return state().tick_hz; }
 
 void ConfigureBackbuffer(unsigned& width, unsigned& height) {
@@ -391,9 +393,9 @@ void LogConfig() {
 
     Msg("* [headless] profile=%s tick=%uHz backbuffer=%ux%u", ProfileName(), TickRateHz(),
         state().backbuffer_width, state().backbuffer_height);
-    Msg("* [headless] render=%s sound=%s ui=%s local_actor=%s", RenderEnabled() ? "on" : "off",
+    Msg("* [headless] render=%s sound=%s ui=%s local_actor=%s ai=%s", RenderEnabled() ? "on" : "off",
         SoundEnabled() ? "on" : "off", UiEnabled() ? "on" : "off",
-        LocalActorEnabled() ? "on" : "off");
+        LocalActorEnabled() ? "on" : "off", SimulationEnabled() ? "on" : "off");
 
     if (!Debug::AnyRequested()) {
         return;

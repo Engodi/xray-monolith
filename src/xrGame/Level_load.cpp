@@ -18,8 +18,7 @@
 #include "character_reputation.h"
 #include "monster_community.h"
 #include "HudManager.h"
-
-extern ENGINE_API bool g_dedicated_server;
+#include "../xrEngine/ai_simulation.h"
 
 bool CLevel::Load_GameSpecific_Before()
 {
@@ -32,7 +31,9 @@ bool CLevel::Load_GameSpecific_Before()
 		!net_Hosts.empty())
 		ai().load(net_SessionName());
 
-	if (!g_dedicated_server && !ai().get_alife() && ai().get_game_graph() && FS.exist(fn_game, "$level$", "level.game"))
+	// F0-05: patrol paths are AI state; a headless process loads them even
+	// though it has no presentation layer.
+	if (ai_simulation_enabled() && !ai().get_alife() && ai().get_game_graph() && FS.exist(fn_game, "$level$", "level.game"))
 	{
 		IReader* stream = FS.r_open(fn_game);
 		ai().patrol_path_storage_raw(*stream);
@@ -171,7 +172,9 @@ bool CLevel::Load_GameSpecific_After()
 		}
 	}
 
-	if (!g_dedicated_server)
+	// F0-05: the level script process is the gameplay entry point; headless runs
+	// it, only a dedicated server skips it.
+	if (ai_simulation_enabled())
 	{
 		// loading scripts
 		ai().script_engine().remove_script_process(ScriptEngine::eScriptProcessorLevel);

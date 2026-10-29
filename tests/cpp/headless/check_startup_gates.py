@@ -21,6 +21,17 @@ D3D/shader compilation under Wine:
 4. `full_memory_stats` (executed by `Console->Execute("stat_memory")` during
    startup, before the level is loaded) must not call `lua_gc` on a script
    engine that a headless/dedicated process never created.
+5. Headless is *not* a dedicated server (F0-05): the AI space (game/level graph,
+   cover manager, patrol paths) and the Lua script engine are simulation, not
+   presentation, so every site that decides "does this process own an AI space /
+   script engine?" must use `ai_simulation_enabled()` and never
+   `g_dedicated_server` directly. In the same files the presentation-only
+   managers (audio, debug drawing, statistics) must keep the
+   `g_dedicated_server` gate, otherwise a headless process would touch a device
+   it does not own.
+6. The coop Lua bridge must go through `ai().get_script_engine()` and bail out
+   when the process has no script engine at all (dedicated server), instead of
+   dereferencing the AI space.
 
 Usage: tests/cpp/headless/check_startup_gates.py [--root <engine-root>]
 """
@@ -41,7 +52,28 @@ CONSOLE_COMMANDS = Path("src/xrGame/console_commands.cpp")
 AI_SPACE = Path("src/xrGame/ai_space.h")
 AI_SPACE_INLINE = Path("src/xrGame/ai_space_inline.h")
 
+# F0-05: simulation (AI space + script engine) versus presentation split.
+AI_SIMULATION = Path("src/xrEngine/ai_simulation.h")
+AI_SPACE_IMPL = Path("src/xrGame/ai_space.cpp")
+LEVEL_LOAD = Path("src/xrGame/Level_load.cpp")
+LEVEL = Path("src/xrGame/Level.cpp")
+LEVEL_NETWORK = Path("src/xrGame/Level_network.cpp")
+GAME_OBJECT = Path("src/xrGame/GameObject.cpp")
+ACTOR = Path("src/xrGame/Actor.cpp")
+HIT_MEMORY = Path("src/xrGame/hit_memory_manager.cpp")
+VISUAL_MEMORY = Path("src/xrGame/visual_memory_manager.cpp")
+SOUND_MEMORY = Path("src/xrGame/sound_memory_manager.cpp")
+LEVEL_NETWORK_SPAWN = Path("src/xrGame/Level_network_spawn.cpp")
+OBJECT_FACTORY_REGISTER = Path("src/xrServerEntities/object_factory_register.cpp")
+OBJECT_FACTORY_SCRIPT = Path("src/xrServerEntities/object_factory_script.cpp")
+COOP_BRIDGE = Path("src/xrGame/coop/coop_bridge_script.cpp")
+COOP_RUNTIME = Path("src/xrGame/coop/coop_core_runtime.cpp")
+HEADLESS_HEADER = Path("src/xrCore/headless.h")
+HEADLESS_SOURCE = Path("src/xrCore/headless.cpp")
+
 HEADLESS = "Headless::Active()"
+AI_PREDICATE = "ai_simulation_enabled()"
+DEDICATED = "g_dedicated_server"
 
 
 def read(path: Path) -> str:
@@ -275,12 +307,230 @@ def check_ai_space(root: Path, errors: list[str]) -> None:
         fail(errors, AI_SPACE_INLINE, "get_script_engine() must return m_script_engine")
 
 
+# ---------------------------------------------------------------------------
+# F0-05: headless keeps the AI space / script engine, dedicated does not.
+# ---------------------------------------------------------------------------
+
+# Whole bodies that must decide on ai_simulation_enabled() and never look at
+# g_dedicated_server: that is the AI/script core of a level.
+AI_SIMULATION_BODIES = (
+    (AI_SPACE_IMPL, "CAI_Space::init"),
+    (AI_SPACE_IMPL, "CAI_Space::unload"),
+    (AI_SPACE_IMPL, "CAI_Space::patrol_path_storage_raw"),
+    (AI_SPACE_IMPL, "CAI_Space::patrol_path_storage"),
+)
+
+# (file, marker): the closest preceding gate of *every* occurrence of `marker`
+# must be ai_simulation_enabled(), because a headless process owns all of it.
+AI_MARKERS = (
+    (LEVEL_LOAD, "patrol_path_storage_raw"),
+    (LEVEL_LOAD, "add_script_process"),
+    (LEVEL, "xr_new<CMapManager>"),
+    (LEVEL, "xr_new<CGameTaskManager>"),
+    (LEVEL, "xr_new<CSpaceRestrictionManager>"),
+    (LEVEL, "xr_new<CClientSpawnManager>"),
+    (LEVEL, "remove_script_process"),
+    (LEVEL, "MapManager().Update()"),
+    (LEVEL, "eScriptProcessorLevel)->update()"),
+    (LEVEL, "script_gc()"),
+    (LEVEL_NETWORK, "space_restriction_manager().clear()"),
+    (LEVEL_NETWORK, "client_spawn_manager().clear()"),
+    (LEVEL_NETWORK, "collect_all_garbage()"),
+    (GAME_OBJECT, "ai_location().reinit()"),
+    (GAME_OBJECT, "CScriptBinder::reload"),
+    (GAME_OBJECT, "CScriptBinder::reinit"),
+    (GAME_OBJECT, "CScriptBinder::shedule_Update"),
+    (ACTOR, "memory().reinit()"),
+    (ACTOR, "memory().reload("),
+    # Per-object delayed-spawn callbacks: AI perception resolves spawns through
+    # the client spawn manager, which a headless process now owns.
+    (HIT_MEMORY, "client_spawn_manager().add("),
+    (VISUAL_MEMORY, "client_spawn_manager().add("),
+    (SOUND_MEMORY, "client_spawn_manager().add("),
+    (LEVEL_NETWORK_SPAWN, "client_spawn_manager().clear(O->ID())"),
+    (LEVEL_NETWORK_SPAWN, "client_spawn_manager().callback(O)"),
+)
+
+# (file, marker): a ternary that allocates AI state, so the predicate sits on
+# the same line as the marker instead of in a preceding `if`.
+AI_INLINE_MARKERS = (
+    (GAME_OBJECT, "m_ai_location ="),
+    (ACTOR, "m_memory ="),
+)
+
+# Presentation-only state must stay behind g_dedicated_server: a headless
+# process owns no audio device and no font/shader state.
+PRESENTATION_MARKERS = (
+    (LEVEL_LOAD, "m_level_sound_manager->Load"),
+    (LEVEL, "xr_new<CLevelSoundManager>"),
+    (LEVEL, "CLevelSoundManager::Update"),
+    (LEVEL, "xr_new<CDebugRenderer>"),
+    (LEVEL, "psDeviceFlags.test(rsStatistic)"),
+)
+
+# Lua bridge files: the AI space may have no script engine at all.
+COOP_SCRIPT_ENGINE_FILES = (COOP_BRIDGE, COOP_RUNTIME)
+
+
+def nearest_gate(text: str, marker: str, start: int) -> tuple[str | None, int]:
+    """Which simulation gate guards `marker`, and where the marker starts."""
+    index = text.find(marker, start)
+    if index < 0:
+        return None, -1
+    prefix = text[:index]
+    simulation = prefix.rfind(AI_PREDICATE)
+    dedicated = prefix.rfind(DEDICATED)
+    if simulation < 0 and dedicated < 0:
+        return "none", index
+    return ("simulation" if simulation > dedicated else "dedicated"), index
+
+
+def check_ai_simulation_split(root: Path, errors: list[str]) -> None:
+    for path, signature in AI_SIMULATION_BODIES:
+        text = strip_comments(read(root / path))
+        body = require_body(text, path, signature, errors)
+        if body is None:
+            continue
+        if AI_PREDICATE not in body:
+            fail(
+                errors,
+                path,
+                f"{signature} still decides on g_dedicated_server alone; "
+                "headless must build the AI space and the script engine",
+            )
+        if DEDICATED in body:
+            fail(
+                errors,
+                path,
+                f"{signature} tests g_dedicated_server directly; use {AI_PREDICATE}",
+            )
+
+    for path, marker in AI_MARKERS + PRESENTATION_MARKERS:
+        text = strip_comments(read(root / path))
+        wanted = "simulation" if (path, marker) in AI_MARKERS else "dedicated"
+        expected_flag = AI_PREDICATE if wanted == "simulation" else DEDICATED
+        gate, index = nearest_gate(text, marker, 0)
+        if gate is None:
+            fail(errors, path, f"'{marker}' not found")
+            continue
+        while index >= 0:
+            if gate != wanted:
+                fail(
+                    errors,
+                    path,
+                    f"'{marker}' is guarded by the wrong flag (found: {gate}); "
+                    f"expected {expected_flag}",
+                )
+            gate, index = nearest_gate(text, marker, index + len(marker))
+
+    for path, marker in AI_INLINE_MARKERS:
+        text = strip_comments(read(root / path))
+        found = False
+        for line in text.splitlines():
+            if marker not in line:
+                continue
+            found = True
+            if AI_PREDICATE not in line:
+                fail(
+                    errors,
+                    path,
+                    f"'{marker}' line does not use {AI_PREDICATE}: {line.strip()}",
+                )
+            if DEDICATED in line:
+                fail(errors, path, f"'{marker}' line still tests g_dedicated_server")
+        if not found:
+            fail(errors, path, f"'{marker}' not found")
+
+
+def check_ai_simulation_header(root: Path, errors: list[str]) -> None:
+    text = strip_comments(read(root / AI_SIMULATION))
+    if not re.search(r"inline\s+bool\s+ai_simulation_enabled\s*\(\s*\)", text):
+        fail(errors, AI_SIMULATION, "inline ai_simulation_enabled() helper is missing")
+    if DEDICATED not in text:
+        fail(errors, AI_SIMULATION, "helper never reads g_dedicated_server")
+    if "Headless::" not in text:
+        fail(errors, AI_SIMULATION, "helper ignores the headless profile")
+
+    header = strip_comments(read(root / HEADLESS_HEADER))
+    if not re.search(r"\bbool\s+SimulationEnabled\s*\(\s*\)", header):
+        fail(errors, HEADLESS_HEADER, "Headless::SimulationEnabled() is not declared")
+
+    source = strip_comments(read(root / HEADLESS_SOURCE))
+    body = body_of(source, "SimulationEnabled")
+    if body is None:
+        fail(errors, HEADLESS_SOURCE, "Headless::SimulationEnabled() is not implemented")
+    elif "Active()" not in body:
+        fail(errors, HEADLESS_SOURCE, "SimulationEnabled() must follow the headless profile")
+
+    config = body_of(source, "LogConfig")
+    if config is None:
+        fail(errors, HEADLESS_SOURCE, "Headless::LogConfig() is missing")
+    elif "ai=" not in config:
+        fail(
+            errors,
+            HEADLESS_SOURCE,
+            "LogConfig() does not report the AI/script state ('ai=on'); "
+            "the harness cannot verify the headless simulation from the log",
+        )
+
+
+def check_object_factory(root: Path, errors: list[str]) -> None:
+    """A headless process registers script classes from Lua, not from the
+    dedicated-only C++ stubs: both paths would register the same clsid."""
+    text = strip_comments(read(root / OBJECT_FACTORY_REGISTER))
+    skip_when_scripts = re.compile(r"if\s*\(\s*" + re.escape(AI_PREDICATE) + r"\s*\)\s*return\s*;")
+    if skip_when_scripts.search(text) is None:
+        fail(
+            errors,
+            OBJECT_FACTORY_REGISTER,
+            "the dedicated-only class stubs are not skipped when the process runs "
+            f"scripts; guard them with 'if ({AI_PREDICATE}) return;'",
+        )
+    if re.search(r"if\s*\(\s*!\s*" + re.escape(DEDICATED) + r"\s*\)\s*return\s*;", text):
+        fail(
+            errors,
+            OBJECT_FACTORY_REGISTER,
+            "dedicated-only stubs are skipped on g_dedicated_server, so a headless "
+            "process registers every script clsid twice",
+        )
+
+    script = strip_comments(read(root / OBJECT_FACTORY_SCRIPT))
+    body = body_of(script, "CObjectFactory::register_script_classes")
+    if body is None:
+        fail(errors, OBJECT_FACTORY_SCRIPT, "CObjectFactory::register_script_classes is missing")
+    elif AI_PREDICATE not in body or DEDICATED in body:
+        fail(
+            errors,
+            OBJECT_FACTORY_SCRIPT,
+            f"register_script_classes() must build the AI space via {AI_PREDICATE}",
+        )
+
+
+def check_coop_script_engine(root: Path, errors: list[str]) -> None:
+    for path in COOP_SCRIPT_ENGINE_FILES:
+        text = strip_comments(read(root / path))
+        if "ai().script_engine()" in text:
+            fail(
+                errors,
+                path,
+                "dereferences ai().script_engine() directly; use "
+                "ai().get_script_engine() and bail out when it is null "
+                "(dedicated server has no script engine)",
+            )
+        if "get_script_engine()" not in text:
+            fail(errors, path, "no ai().get_script_engine() guard found")
+
+
 CHECKS = (
     check_engine_api,
     check_device_create,
     check_renderer_guards,
     check_memory_stats,
     check_ai_space,
+    check_ai_simulation_split,
+    check_ai_simulation_header,
+    check_object_factory,
+    check_coop_script_engine,
 )
 
 

@@ -1126,6 +1126,11 @@ int APIENTRY WinMain_impl(HINSTANCE hInstance,
 	// Headless (F0-04): reuse the engine's existing "no GPU / no local output"
 	// gating (originally the DEDICATED_SERVER build switch) as a runtime mode,
 	// and log the resolved configuration for the harness logs.
+	//
+	// F0-05: the flag only means "presentation is off" here - a headless process
+	// is NOT a dedicated server. It keeps the full simulation (AI space, patrol
+	// paths, Lua script engine), which the AI/script paths select through
+	// ai_simulation_enabled() (xrEngine/ai_simulation.h) instead of this flag.
 	if (Headless::Active())
 	{
 		g_dedicated_server = true;

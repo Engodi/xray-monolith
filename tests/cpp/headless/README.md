@@ -29,6 +29,13 @@ tests/cpp/headless/run.sh
   `CRender::create`, `CRender::level_Load`) keep their headless early returns
   before the first GPU/shader call, and `full_memory_stats` never calls
   `lua_gc` on the (absent) headless script engine.
+- **simulation vs presentation split** (F0-05): `test_ai_simulation.cpp` checks
+  the truth table of `ai_simulation_enabled()` (normal game and every headless
+  profile own an AI space / script engine, a dedicated server does not), and the
+  structural gate checks that the AI/script sites of `xrGame` are guarded by
+  that predicate while the audio/debug/statistics sites stay behind
+  `g_dedicated_server`, and that the coop Lua bridge goes through
+  `ai().get_script_engine()` instead of dereferencing the AI space.
 
 ## What is *not* covered
 

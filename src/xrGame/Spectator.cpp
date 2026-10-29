@@ -11,6 +11,7 @@
 #include "xrServer_Objects.h"
 #include "game_cl_base.h"
 #include "level.h"
+#include "../xrEngine/ai_simulation.h"
 #include "xr_level_controller.h"
 #include "seniority_hierarchy_holder.h"
 #include "team_hierarchy_holder.h"
@@ -540,7 +541,7 @@ BOOL CSpectator::net_Spawn(CSE_Abstract* DC)
 void CSpectator::net_Destroy()
 {
 	inherited::net_Destroy();
-	if (!g_dedicated_server)
+	if (ai_simulation_enabled())
 		Level().MapManager().OnObjectDestroyNotify(ID());
 }
 

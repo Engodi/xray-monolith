@@ -52,6 +52,50 @@ CLevel::OnFrame
 Таблица `coop_runtime` (Luabind) отдаёт `available/start/status/command`;
 Lua-фасад — `gamedata/scripts/coop_core.script` (`coop_core.*`).
 
+## 2.1. Headless ≠ dedicated server: AI space и script engine (F0-05)
+
+`-headless_server` / `-headless_client` — это **полная симуляция без
+презентации**, а не «упрощённый сервер». Поэтому headless обязан строить то,
+без чего coop-хост не работает:
+
+| Подсистема | Headless | Dedicated (`g_dedicated_server` без headless) |
+|---|---|---|
+| AI space: `CEF_Storage`, `CGraphEngine`, `CCoverManager`, `CPatrolPathStorage`, `moving_objects` | **есть** | нет |
+| Lua script engine (`ai().script_engine()`), level script process | **есть** | нет |
+| `CAI_ObjectLocation` у объектов, `CScriptBinder` (object-скрипты) | **есть** | нет |
+| Память актора (`CActorMemory`) | **есть** | нет |
+| `CMapManager`, `CGameTaskManager`, `CSpaceRestrictionManager`, `CClientSpawnManager`, `CAutosaveManager` | **есть** | нет |
+| Рендер, звук, UI, локальный актор, партиклы, статистика, консоль | нет | нет |
+
+Флаг `g_dedicated_server` в headless-профиле по-прежнему включён (F0-04): это
+движковый гейт «нет презентации» (D3D, звук, шрифты, партиклы, console draw).
+Из-за этого решение «есть ли у процесса AI space / script engine» **нельзя**
+принимать по `g_dedicated_server` — иначе `ai().script_engine()` остаётся
+`nullptr` и Lua-мост падает на загрузке уровня. Единственный правильный
+предикат — `ai_simulation_enabled()` (`src/xrEngine/ai_simulation.h`):
+
+```cpp
+inline bool ai_simulation_enabled() { return !g_dedicated_server || Headless::SimulationEnabled(); }
+```
+
+Правило: в `xrGame` «AI/скрипты/патрульные пути/ограничения/callback'и спавна»
+гейтятся `ai_simulation_enabled()`, а «звук/отрисовка/UI/статистика» —
+`g_dedicated_server`. Это зафиксировано структурным гейтом
+`tests/cpp/headless/check_startup_gates.py`, а таблица истинности предиката
+проверяется `tests/cpp/headless/run.sh` (`test_ai_simulation.cpp`).
+
+Что видно в логе headless-процесса:
+
+```
+* [headless] profile=server tick=60Hz backbuffer=640x480
+* [headless] render=off sound=off ui=off local_actor=off ai=on
+* [headless] AI space ready: graphs, cover, patrol paths, script engine
+```
+
+Coop Lua-мост (`coop_bridge_script.cpp`, `coop_core_runtime.cpp`) ходит в
+скрипты только через `ai().get_script_engine()` и при `nullptr` (dedicated)
+не падает, а откладывает сообщение / пропускает bootstrap.
+
 ## 3. Артефакты прогона
 
 ```

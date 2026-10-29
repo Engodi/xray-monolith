@@ -188,7 +188,7 @@
 #endif // NO_XR_GAME
 
 #ifndef NO_XR_GAME
-extern ENGINE_API bool g_dedicated_server;
+#	include "../xrEngine/ai_simulation.h"
 #	define ADD(a,b,c,d)			add<a,b>(c,d)
 #	define ADD_MP(a,b,c,d,e,f)	add(xr_new<CObjectItemClientServerSingleMp<a,b,c,d> >(e,f))
 #else
@@ -435,7 +435,11 @@ void CObjectFactory::register_classes()
 	// because we do not have scripts
 	// and script functionality is not
 	// needed here
-	if (!g_dedicated_server)
+	//
+	// F0-05: a headless process *does* run the script engine, so it must take
+	// the script path below (Lua `class_registrator`) instead of registering
+	// these C++ stubs - otherwise every script clsid is registered twice.
+	if (ai_simulation_enabled())
 		return;
 
 	ADD(CElectricBall, CSE_ALifeItemArtefact, TEXT2CLSID("SCRPTART"), "artefact_s");

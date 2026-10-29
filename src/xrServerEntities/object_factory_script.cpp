@@ -65,13 +65,15 @@ void CObjectFactory::register_script_class(LPCSTR unknown_class, LPCSTR clsid, L
 }
 
 #ifndef NO_XR_GAME
-extern ENGINE_API bool g_dedicated_server;
+#	include "../xrEngine/ai_simulation.h"
 #endif // NO_XR_GAME
 
 void CObjectFactory::register_script_classes()
 {
 #ifndef NO_XR_GAME
-	if (!g_dedicated_server)
+	// F0-05: the AI space / script engine is required whenever the process runs
+	// scripts; a dedicated server (no simulation) skips it.
+	if (ai_simulation_enabled())
 #endif // NO_XR_GAME
 		ai();
 }

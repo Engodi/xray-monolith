@@ -6,6 +6,7 @@
 #include "ai_debug.h"
 #include "CustomMonster.h"
 #include "ai_space.h"
+#include "../xrEngine/ai_simulation.h"
 #include "ai/monsters/BaseMonster/base_monster.h"
 #include "xrserver_objects_alife_monsters.h"
 #include "xrserver.h"
@@ -120,10 +121,10 @@ CCustomMonster::~CCustomMonster()
 
 #ifdef DEBUG
 	Msg							("dumping client spawn manager stuff for object with id %d",ID());
-	if(!g_dedicated_server)
+	if(ai_simulation_enabled())
 		Level().client_spawn_manager().dump	(ID());
 #endif // DEBUG
-	if (!g_dedicated_server)
+	if (ai_simulation_enabled())
 		Level().client_spawn_manager().clear(ID());
 }
 
