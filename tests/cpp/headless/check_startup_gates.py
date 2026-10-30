@@ -20,7 +20,11 @@ D3D/shader compilation under Wine:
    returns *before* the first GPU/shader/swap-chain call.
 4. `full_memory_stats` (executed by `Console->Execute("stat_memory")` during
    startup, before the level is loaded) must not call `lua_gc` on a script
-   engine that a headless/dedicated process never created.
+   engine that a headless/dedicated process never created - and it must not go
+   through `ai()` either: that accessor *lazily constructs* the AI space (Lua
+   VM, class registrators, string interning) from inside a statistics command,
+   so the whole simulation world was bootstrapped by `stat_memory` and died
+   while `export_classes()` interned its first string.
 5. Headless is *not* a dedicated server (F0-05): the AI space (game/level graph,
    cover manager, patrol paths) and the Lua script engine are simulation, not
    presentation, so every site that decides "does this process own an AI space /
@@ -32,6 +36,17 @@ D3D/shader compilation under Wine:
 6. The coop Lua bridge must go through `ai().get_script_engine()` and bail out
    when the process has no script engine at all (dedicated server), instead of
    dereferencing the AI space.
+7. `CResourceManager::CreateGeom` must not fabricate a GPU geometry record: a
+   geometry without a vertex declaration (`dcl=0`, `vb_stride=0`) is a stub no
+   consumer can describe, and the device path then writes through a "zero"
+   pointer - in headless that write landed inside the LuaJIT GC pool and
+   corrupted the string-interning table (AV in `lj_str_new`). Without a
+   declaration the factory returns `nullptr`, and the backend tolerates it.
+8. The headless configuration must not live in one module only: `xrCore` is a
+   static library, so the executable and the renderer DLL each own a copy of
+   `headless.cpp`, and a module that never called `Headless::Parse()` used to
+   report "not headless" and run the GPU path. Every accessor must resolve the
+   per-module state from the process command line on first use.
 
 Usage: tests/cpp/headless/check_startup_gates.py [--root <engine-root>]
 """
@@ -82,6 +97,7 @@ GAME_LEVEL_ENGINE = Path("src/xrEngine/IGame_Level.cpp")
 ENVIRONMENT_RENDER = Path("src/xrEngine/Environment_render.cpp")
 LENS_FLARE = Path("src/xrEngine/xr_efflensflare.cpp")
 RESOURCE_MANAGER_DX10 = Path("src/Layers/xrRenderDX10/dx10ResourceManager_Resources.cpp")
+RENDER_BACKEND_DX10 = Path("src/Layers/xrRenderDX10/dx10R_Backend_Runtime.h")
 DEBUG_NEW = Path("src/xrCore/xrDebugNew.cpp")
 IO_CONSOLE = Path("src/xrEngine/XR_IOConsole.cpp")
 
@@ -290,6 +306,19 @@ def check_memory_stats(root: Path, errors: list[str]) -> None:
     if stats is None:
         return
 
+    # `ai()` is not a getter: it constructs the AI space (Lua VM, class
+    # registrators) on first use. `stat_memory` runs during startup, before the
+    # level is loaded, so the accessor turned a statistics command into the
+    # world bootstrap - and the bootstrap faulted while interning strings.
+    if re.search(r"\bai\s*\(\s*\)", stats):
+        fail(
+            errors,
+            CONSOLE_COMMANDS,
+            "full_memory_stats calls ai(); the accessor lazily constructs the AI space "
+            "(Lua VM + class registrators) from a memory-statistics command - "
+            "the AI space must be built at level load, not by stat_memory",
+        )
+
     guarded = re.compile(r"get_script_engine\s*\(\s*\)")
     for match in re.finditer(r"lua_gc\s*\(", stats):
         window = stats[max(0, match.start() - 400):match.start()]
@@ -299,6 +328,13 @@ def check_memory_stats(root: Path, errors: list[str]) -> None:
                 CONSOLE_COMMANDS,
                 "full_memory_stats calls lua_gc() without a get_script_engine() guard; "
                 "a headless process has no Lua state there (startup page fault)",
+            )
+        if "g_ai_space" not in window:
+            fail(
+                errors,
+                CONSOLE_COMMANDS,
+                "full_memory_stats must query g_ai_space directly (an already constructed "
+                "AI space) instead of building one through ai()",
             )
     if "ai().script_engine().lua()" in stats:
         fail(
@@ -612,16 +648,57 @@ def check_headless_startup_degradation(root: Path, errors: list[str]) -> None:
     text = strip_comments(read(root / RESOURCE_MANAGER_DX10))
     geom = require_body(text, RESOURCE_MANAGER_DX10, "CResourceManager::CreateGeom", errors)
     if geom is not None:
-        if HEADLESS not in geom:
+        new_record = geom.find("xr_new<SGeometry>")
+        if new_record < 0:
+            fail(errors, RESOURCE_MANAGER_DX10, "CreateGeom no longer allocates SGeometry?")
+        # A geometry without a vertex declaration cannot describe a vertex
+        # layout. Building one anyway produced a record with dcl=0/vb_stride=0
+        # that the device path dereferenced as a pointer; the write landed in
+        # the LuaJIT GC pool and corrupted the string-interning table.
+        reject = re.search(
+            r"if\s*\([^)]*!\s*decl\b[^)]*\)\s*\{?[^}]*?return\s+nullptr",
+            geom,
+            re.DOTALL,
+        )
+        if reject is None or (0 <= new_record < reject.start()):
             fail(
                 errors,
                 RESOURCE_MANAGER_DX10,
-                "CreateGeom asserts on a null vertex buffer; headless model loading needs a CPU-side path",
+                "CreateGeom must return nullptr (not a stub) when the vertex declaration is "
+                "missing: a SGeometry with dcl=0 is dereferenced as a null device object",
             )
-        else:
-            assertion = re.search(r"^\s*R_ASSERT\s*\(\s*decl\s*&&\s*vb\s*\)", geom, re.MULTILINE)
-            if assertion is not None and "!headless" not in geom[max(0, assertion.start() - 160):assertion.start()]:
-                fail(errors, RESOURCE_MANAGER_DX10, "CreateGeom keeps an unconditional decl && vb assertion")
+        if re.search(r"decl\s*\?\s*_CreateDecl\s*\(\s*decl\s*\)\s*:\s*(?:0|nullptr)", geom):
+            fail(
+                errors,
+                RESOURCE_MANAGER_DX10,
+                "CreateGeom still fabricates a geometry with dcl=0 when decl is missing",
+            )
+        if not re.search(r"!\s*decl", geom) or HEADLESS not in geom:
+            fail(
+                errors,
+                RESOURCE_MANAGER_DX10,
+                "CreateGeom must reject a missing declaration and keep the headless gate "
+                "for the (device-less) vertex buffer",
+            )
+
+    # The backend hands a geometry over to the device; "no geometry" must be a
+    # no-op instead of a null dereference (headless visuals reach it).
+    backend = strip_comments(read(root / RENDER_BACKEND_DX10))
+    bind = require_body(backend, RENDER_BACKEND_DX10, "CBackend::set_Geometry", errors)
+    if bind is not None:
+        if not re.search(r"if\s*\(\s*!\s*_geom\b[^)]*\)\s*return\s*;", bind):
+            fail(
+                errors,
+                RENDER_BACKEND_DX10,
+                "set_Geometry must tolerate a null geometry (CreateGeom returns nullptr "
+                "when the GPU cannot describe the vertex layout)",
+            )
+        if not re.search(r"!\s*_geom\s*->\s*dcl|!\s*_geom\s*\|\|", bind):
+            fail(
+                errors,
+                RENDER_BACKEND_DX10,
+                "set_Geometry must not form a reference to a null dcl (&*_geom->dcl)",
+            )
 
     text = strip_comments(read(root / DEBUG_NEW))
     handler = body_of(text, "UnhandledFilter")
@@ -640,6 +717,44 @@ def check_headless_startup_degradation(root: Path, errors: list[str]) -> None:
         fail(errors, IO_CONSOLE, "dump_cvar on crash must not fault on a half-initialised subsystem")
 
 
+def check_headless_module_state(root: Path, errors: list[str]) -> None:
+    """Headless state must be resolved per module, not by one Parse() call."""
+
+    text = strip_comments(read(root / HEADLESS_SOURCE))
+
+    command_line = body_of(text, "process_command_line")
+    if command_line is None or "GetCommandLineA" not in command_line:
+        fail(
+            errors,
+            HEADLESS_SOURCE,
+            "headless.cpp must read the process command line (GetCommandLineA): xrCore is a "
+            "static library, so the renderer DLL owns its own copy of this state and never "
+            "sees the executable's Parse() call - it then runs the GPU path",
+        )
+
+    ensure = body_of(text, "ensure_parsed")
+    if ensure is None or "process_command_line" not in ensure:
+        fail(
+            errors,
+            HEADLESS_SOURCE,
+            "headless.cpp must bootstrap an unparsed module from the process command line "
+            "(ensure_parsed -> process_command_line)",
+        )
+    resolved = body_of(text, "resolved_state")
+    if resolved is None or "ensure_parsed" not in resolved:
+        fail(
+            errors,
+            HEADLESS_SOURCE,
+            "the public accessors must resolve the state through resolved_state() so a module "
+            "that never called Parse() still reports the launch profile",
+        )
+
+    header = strip_comments(read(root / HEADLESS_HEADER))
+    for name in ("Parse", "Active", "Profile"):
+        if not re.search(r"XRCORE_API[^\n;]*\b" + name + r"\s*\(", header):
+            fail(errors, HEADLESS_HEADER, f"Headless::{name}() must be part of the exported xrCore surface (XRCORE_API)")
+
+
 CHECKS = (
     check_engine_api,
     check_device_create,
@@ -651,6 +766,7 @@ CHECKS = (
     check_object_factory,
     check_coop_script_engine,
     check_headless_startup_degradation,
+    check_headless_module_state,
 )
 
 

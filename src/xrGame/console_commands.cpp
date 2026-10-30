@@ -399,12 +399,15 @@ static void full_memory_stats()
 	CInifile::GetCacheStats(DLTX_files_cached, DLTX_total_bytes, DLTX_section_count);
 	Msg("* [x-ray]: DLTX Cache: Files Cached: %zu, Sections Total %zu, Usage: %.2f MB", DLTX_files_cached, DLTX_section_count, (double)DLTX_total_bytes / 1024 / 1024);
 	
-	// Headless / dedicated (F0-04): a process that runs without a render window
-	// does not create the game script engine, so the Lua state may be absent.
-	// Calling lua_gc on a null state faulted during startup (long before the
-	// level was loaded) and the crash happened while the log buffer was still
-	// unflushed, so the harness saw an empty engine log.
-	CScriptEngine* script_engine = ai().get_script_engine();
+	// The Lua state is *read*, never constructed: `ai()` is a lazy accessor that
+	// builds the AI space (Lua VM, class registrators, string interning) on
+	// first use. `stat_memory` runs during startup, before the level is loaded,
+	// so going through `ai()` here turned a memory dump into the world bootstrap
+	// and the bootstrap faulted while interning its first strings. The AI space
+	// is built where it belongs - level load (`CLevel::Load_GameSpecific_*`) -
+	// and a process that has none (headless before load, dedicated server)
+	// simply reports that the script engine is not running.
+	CScriptEngine* script_engine = g_ai_space ? g_ai_space->get_script_engine() : nullptr;
 	if (script_engine)
 	{
 		size_t lua_mem = lua_gc(script_engine->lua(), LUA_GCCOUNT, 0);

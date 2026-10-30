@@ -360,6 +360,13 @@ IC void CBackend::Render(D3DPRIMITIVETYPE T, u32 startV, u32 PC)
 
 IC void CBackend::set_Geometry(SGeometry* _geom)
 {
+	// A geometry record only exists when the GPU can describe the vertex layout
+	// (CResourceManager::CreateGeom returns nullptr otherwise). A headless
+	// process still executes the CPU side of model/effect code that binds a
+	// geometry, so "no geometry" is a no-op: nothing is drawn there, and forming
+	// a reference to a null declaration would fault immediately (F0-04).
+	if (!_geom || !_geom->dcl) return;
+
 	set_Format(&*_geom->dcl);
 
 	set_Vertices(_geom->vb, _geom->vb_stride);

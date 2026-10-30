@@ -41,6 +41,17 @@ bool flag_arg(int argc, char** argv, int index, bool fallback) {
 
 int main(int argc, char** argv) {
     const char* launch = (argc > 1) ? argv[1] : "";
+
+    // A module that links xrCore statically (the renderer DLL) never calls
+    // Parse(): its getters must answer with production-safe defaults instead of
+    // running the GPU path or handing out a zero tick rate.
+    expect(!Headless::Active(), "unparsed module is not headless");
+    expect_text("unparsed profile", "none", Headless::ProfileName());
+    expect(Headless::TickRateHz() == 60u, "unparsed tick rate is the default 60 Hz");
+    expect(Headless::SimulationEnabled() == false, "unparsed module keeps the presentation path");
+    expect(!Headless::Debug::Enabled(), "unparsed module has no debug surface");
+    expect(Headless::Debug::SpawnCount() == 0, "unparsed module has no spawns");
+
     Headless::Parse(launch);
 
     expect(Headless::Parsed(), "parsed flag");

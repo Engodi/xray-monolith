@@ -39,10 +39,30 @@ void XR_INIT()
 {
 	if (inited)
 		return;
+
+	// LuaJIT is built without LJ_GC64: `GCRef` is a 32-bit pointer, so every GC
+	// object must live below 4 GB. The ZeroBits hint is the only thing keeping
+	// the pool there; a pool above 4 GB would silently truncate pointers and
+	// corrupt the VM's own structures (the string-interning table is the first
+	// victim). Refuse such a reservation instead of handing out addresses the VM
+	// cannot represent: the VM then fails with its regular "not enough memory"
+	// error, which the engine logs, instead of faulting inside lj_str_new.
 	g_heap = NULL;
+	if (ntavm == NULL) {
+		return;
+	}
 	size_t size = CHUNK_SIZE * CHUNK_COUNT;
 	long st = ntavm(INVALID_HANDLE_VALUE, &g_heap, NTAVM_ZEROBITS, &size,
 	                MEM_RESERVE|MEM_COMMIT, PAGE_READWRITE);
+	if (st != 0 || g_heap == NULL ||
+	    (unsigned long long)(uintptr_t)g_heap < 0x10000ull ||
+	    (unsigned long long)(uintptr_t)g_heap + (unsigned long long)size > 0x100000000ull) {
+		if (g_heap != NULL) {
+			VirtualFree(g_heap, 0, MEM_RELEASE);
+			g_heap = NULL;
+		}
+		return;
+	}
 
 	for (int i = 0; i < CHUNK_COUNT; i++)
 		g_heapMap[i] = 'x';
@@ -62,6 +82,8 @@ void* XR_MMAP(size_t size)
 	sprintf(buf, "XR_MMAP(%Iu)", size);
 	OutputDebugString(buf);
 #endif
+	if (g_heap == NULL)
+		return MFAIL;  /* pool unusable: fail the request, never a truncated pointer */
 	int chunks = CHUNKS_FROM_SIZE(size);
 	char* s = find_free(chunks);
 	void* ptr = MFAIL;
@@ -88,6 +110,8 @@ void XR_DESTROY(void* ptr, size_t size)
 	sprintf(buf, "XR_DESTROY(ptr=%p, size=%Iu)", ptr, size);
 	OutputDebugString(buf);
 #endif
+	if (g_heap == NULL || ptr == NULL || ptr == MFAIL)
+		return;  /* nothing was ever handed out by a refused pool */
 	char* s = g_heapMap + ((char*)ptr - (char*)g_heap) / CHUNK_SIZE;
 	int count = CHUNKS_FROM_SIZE(size);
 	for (int i = 0; i < count; i++)

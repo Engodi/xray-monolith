@@ -604,16 +604,25 @@ SGeometry* CResourceManager::CreateGeom(D3DVERTEXELEMENT9* decl, ID3DVertexBuffe
 {
 	xrCriticalSectionGuard guard(creationGuard);
 
-	// Headless: there is no device and therefore no vertex/index buffer, but
-	// model/shader loading still reaches this point (visuals are created CPU
-	// side). Keep the resource record and let shader creation finish; nothing
-	// is ever submitted for rendering (F0-04).
-	const bool headless = Headless::Active();
-	if (!headless)
-		R_ASSERT(decl && vb);
+	// A geometry is a GPU object: the vertex declaration is what describes the
+	// vertex layout, so without it there is nothing to build. A record with
+	// dcl=0/vb_stride=0 is worse than no record at all - every consumer then
+	// treats a null declaration as a device object and writes through it, and in
+	// a headless process that write landed inside the LuaJIT GC pool and
+	// corrupted the string-interning table (AV in lj_str_new).
+	//
+	// Headless (F0-04) has no device, but model/shader loading still runs its
+	// CPU-side path and reaches this point: "no declaration" means "no GPU
+	// geometry", and the callers tolerate nullptr (see CBackend::set_Geometry).
+	if (!decl || (!Headless::Active() && !vb))
+	{
+		if (!Headless::Active())
+			R_ASSERT2(decl && vb, "CreateGeom: a GPU geometry needs a vertex declaration and a vertex buffer");
+		return nullptr;
+	}
 
-	SDeclaration* dcl = decl ? _CreateDecl(decl) : 0;
-	u32 vb_stride = decl ? D3DXGetDeclVertexSize(decl, 0) : 0;
+	SDeclaration* dcl = _CreateDecl(decl);
+	u32 vb_stride = D3DXGetDeclVertexSize(decl, 0);
 
 	// ***** first pass - search already loaded shader
 	for (u32 it = 0; it < v_geoms.size(); it++)

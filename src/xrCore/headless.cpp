@@ -76,26 +76,69 @@ struct SSpawnRequest {
 };
 
 struct SState {
-    bool parsed;
+    // Defaults describe "no launch profile": they are also what an unparsed
+    // module reports before its bootstrap ran (see resolved_state()).
+    bool parsed = false;
 
-    Headless::EProfile profile;
-    unsigned tick_hz;
-    unsigned backbuffer_width;
-    unsigned backbuffer_height;
+    Headless::EProfile profile = Headless::eProfileNone;
+    unsigned tick_hz = 60;
+    unsigned backbuffer_width = 640;
+    unsigned backbuffer_height = 480;
 
-    bool debug_allowed;    // -coop_debug
-    bool debug_requested;  // at least one -dbg_* token / env value
-    bool alife_disabled;
-    bool god_mode;
-    bool has_teleport;
-    float teleport[3];
-    unsigned spawn_count;
-    SSpawnRequest spawns[Headless::Debug::kMaxSpawns];
+    bool debug_allowed = false;    // -coop_debug
+    bool debug_requested = false;  // at least one -dbg_* token / env value
+    bool alife_disabled = false;
+    bool god_mode = false;
+    bool has_teleport = false;
+    float teleport[3] = {0.0f, 0.0f, 0.0f};
+    unsigned spawn_count = 0;
+    SSpawnRequest spawns[Headless::Debug::kMaxSpawns] = {};
 };
 
 SState& state() {
     static SState s;
     return s;
+}
+
+// xrCore is a *static* library: the executable and every DLL that links it
+// (notably the DX11 renderer) get their own copy of this translation unit and
+// therefore their own `static SState`. A module that never called
+// Headless::Parse() used to report "not headless" and silently run the GPU
+// path - that is why the renderer's headless guards did not fire. The command
+// line is process-wide, so an unparsed module bootstraps itself from it.
+const char* process_command_line() {
+#if defined(_WIN32)
+    return ::GetCommandLineA();
+#else
+    // Host-side parser checks (tests/cpp/headless) always pass an explicit
+    // launch line to Parse(); there is no Windows command line to fall back to.
+    return nullptr;
+#endif
+}
+
+// Resolves the per-module configuration before the first query. The one-shot is
+// a function-local static (thread-safe magic static): the renderer DLL may ask
+// its first question from the render thread, and the bootstrap must not run
+// twice.
+void ensure_parsed() {
+    struct SBootstrap {
+        SBootstrap() {
+            if (state().parsed) {
+                return;
+            }
+            const char* line = process_command_line();
+            if (line && line[0]) {
+                Headless::Parse(line);
+            }
+        }
+    };
+    static SBootstrap bootstrap;
+    (void)bootstrap;
+}
+
+const SState& resolved_state() {
+    ensure_parsed();
+    return state();
 }
 
 bool same_token(const char* left, const char* right) {
@@ -332,18 +375,18 @@ void Parse(const char* command_line) {
     parse_debug_environment();
 }
 
-bool Parsed() { return state().parsed; }
+bool Parsed() { return resolved_state().parsed; }
 
-EProfile Profile() { return state().profile; }
+EProfile Profile() { return resolved_state().profile; }
 
-bool Active() { return eProfileNone != state().profile; }
+bool Active() { return eProfileNone != resolved_state().profile; }
 
-bool IsServer() { return eProfileServer == state().profile; }
+bool IsServer() { return eProfileServer == resolved_state().profile; }
 
-bool IsClient() { return eProfileClient == state().profile; }
+bool IsClient() { return eProfileClient == resolved_state().profile; }
 
 const char* ProfileName() {
-    switch (state().profile) {
+    switch (resolved_state().profile) {
     case eProfileServer:
         return "server";
     case eProfileClient:
@@ -363,14 +406,14 @@ bool LocalActorEnabled() { return !Active(); }
 
 bool SimulationEnabled() { return Active(); }
 
-unsigned TickRateHz() { return state().tick_hz; }
+unsigned TickRateHz() { return resolved_state().tick_hz; }
 
 void ConfigureBackbuffer(unsigned& width, unsigned& height) {
     if (!Active()) {
         return;
     }
-    width = state().backbuffer_width;
-    height = state().backbuffer_height;
+    width = resolved_state().backbuffer_width;
+    height = resolved_state().backbuffer_height;
 }
 
 void SleepToNextTick(unsigned elapsed_ms) {
@@ -392,7 +435,7 @@ void LogConfig() {
     }
 
     Msg("* [headless] profile=%s tick=%uHz backbuffer=%ux%u", ProfileName(), TickRateHz(),
-        state().backbuffer_width, state().backbuffer_height);
+        resolved_state().backbuffer_width, resolved_state().backbuffer_height);
     Msg("* [headless] render=%s sound=%s ui=%s local_actor=%s ai=%s", RenderEnabled() ? "on" : "off",
         SoundEnabled() ? "on" : "off", UiEnabled() ? "on" : "off",
         LocalActorEnabled() ? "on" : "off", SimulationEnabled() ? "on" : "off");
@@ -411,39 +454,39 @@ void LogConfig() {
 }
 
 namespace Debug {
-bool Enabled() { return state().debug_allowed; }
+bool Enabled() { return resolved_state().debug_allowed; }
 
-bool AnyRequested() { return state().debug_requested; }
+bool AnyRequested() { return resolved_state().debug_requested; }
 
 bool AlifeDisabled() {
-    const SState& s = state();
+    const SState& s = resolved_state();
     return s.debug_allowed && s.alife_disabled;
 }
 
 bool GodMode() {
-    const SState& s = state();
+    const SState& s = resolved_state();
     return s.debug_allowed && s.god_mode;
 }
 
 bool HasTeleport() {
-    const SState& s = state();
+    const SState& s = resolved_state();
     return s.debug_allowed && s.has_teleport;
 }
 
 void TeleportTarget(float& x, float& y, float& z) {
-    const SState& s = state();
+    const SState& s = resolved_state();
     x = s.teleport[0];
     y = s.teleport[1];
     z = s.teleport[2];
 }
 
 unsigned SpawnCount() {
-    const SState& s = state();
+    const SState& s = resolved_state();
     return s.debug_allowed ? s.spawn_count : 0;
 }
 
 const char* SpawnSection(unsigned index) {
-    const SState& s = state();
+    const SState& s = resolved_state();
     if (!s.debug_allowed || index >= s.spawn_count) {
         return "";
     }
@@ -451,7 +494,7 @@ const char* SpawnSection(unsigned index) {
 }
 
 void SpawnPosition(unsigned index, float& x, float& y, float& z) {
-    const SState& s = state();
+    const SState& s = resolved_state();
     if (index >= s.spawn_count) {
         x = y = z = 0.0f;
         return;
