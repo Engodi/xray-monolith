@@ -364,16 +364,21 @@ bool LoadKernelScriptToGlobal(lua_State* L, const char* name)
 		}
 		else
 		{
-			int errFuncId = -1;
-			int	l_iErrorCode = lua_pcall(L, 0, 0, (-1 == errFuncId) ? 0 : errFuncId);
+			lua_pushcfunction(L, CScriptStorage::lua_traceback);
+			const int errFuncId = lua_gettop(L);
+			lua_insert(L, -2); // [chunk, handler] -> [handler, chunk]
+			int	l_iErrorCode = lua_pcall(L, 0, 0, errFuncId);
 			if (l_iErrorCode)
 			{
+				LPCSTR error = lua_isstring(L, -1) ? lua_tostring(L, -1) : "(non-string error)";
+				Msg("! [SCRIPT ERROR] %s: %s", name, error);
 #ifdef DEBUG
 				g_pScriptEngine->print_output(L, name, l_iErrorCode);
 #endif
 				lua_settop(L, start);
 				return false;
 			}
+			lua_remove(L, errFuncId);
 		}
 
 
@@ -1029,7 +1034,17 @@ bool CScriptStorage::do_file(LPCSTR caScriptName, LPCSTR caNameSpaceName)
 
 	// because that's the first and the only call of the main chunk - there is no point to compile it
 	//	luaJIT_setmode	(lua(),0,LUAJIT_MODE_ENGINE|LUAJIT_MODE_OFF);						// Oles
-	int l_iErrorCode = lua_pcall(lua(), 0, 0, (-1 == errFuncId) ? 0 : errFuncId); // new_Andy
+	// An error handler (traceback) is installed unless the script debugger
+	// provides its own: a startup chunk that throws must leave a readable trace
+	// in the log even in a release build (no `-dbg`).
+	int traceback_id = -1;
+	if (-1 == errFuncId)
+	{
+		lua_pushcfunction(lua(), lua_traceback);
+		traceback_id = lua_gettop(lua());
+		lua_insert(lua(), -2); // [chunk, handler] -> [handler, chunk]
+	}
+	int l_iErrorCode = lua_pcall(lua(), 0, 0, (-1 == errFuncId) ? traceback_id : errFuncId); // new_Andy
 	//	luaJIT_setmode	(lua(),0,LUAJIT_MODE_ENGINE|LUAJIT_MODE_ON);						// Oles
 
 #ifdef USE_DEBUGGER
@@ -1040,14 +1055,16 @@ bool CScriptStorage::do_file(LPCSTR caScriptName, LPCSTR caNameSpaceName)
 #endif // #ifdef USE_DEBUGGER
 	if (l_iErrorCode)
 	{
-//#ifdef DEBUG
 		if (strstr(Core.Params, "-dbg")) print_output(lua(),caScriptName,l_iErrorCode);
-//#endif
+		LPCSTR error = lua_isstring(lua(), -1) ? lua_tostring(lua(), -1) : "(non-string error)";
+		Msg("! [SCRIPT ERROR] %s: %s", caNameSpaceName ? caNameSpaceName : caScriptName, error);
 		on_error(lua());
 		lua_settop(lua(), start);
 		return (false);
 	}
 
+	if (traceback_id != -1)
+		lua_remove(lua(), traceback_id);
 	return (true);
 }
 
@@ -1250,6 +1267,26 @@ bool CScriptStorage::print_output(lua_State* L, LPCSTR caScriptFileName, int iEr
 #endif //-USE_DEBUGGER
 	}
 	return (true);
+}
+
+int CScriptStorage::lua_traceback(lua_State* L)
+{
+	LPCSTR message = lua_isstring(L, 1) ? lua_tostring(L, 1) : "(error object is not a string)";
+	xr_string result = message;
+
+	lua_Debug debug;
+	for (int level = 0; lua_getstack(L, level, &debug); ++level)
+	{
+		lua_getinfo(L, "nSlu", &debug);
+		string512 line;
+		xr_sprintf(line, sizeof(line), "\n  [%d] %s(%d): %s", level,
+		           debug.short_src ? debug.short_src : "?", debug.currentline,
+		           debug.name ? debug.name : "?");
+		result += line;
+	}
+
+	lua_pushstring(L, result.c_str());
+	return 1;
 }
 
 void CScriptStorage::print_error(lua_State* L, int iErrorCode)

@@ -90,6 +90,10 @@ public:
 #endif // #ifdef DEBUG
 	void setup_callbacks();
 	void load_common_scripts();
+	// Runs a global `_initialize` entry point behind a pcall boundary with a
+	// traceback handler. Initialisation scripts must never abort the process:
+	// a failure is logged and the engine keeps starting (headless included).
+	void call_script_initialize(LPCSTR function_name);
 	bool load_file(LPCSTR caScriptName, LPCSTR namespace_name);
 	IC CScriptProcess* script_process(const EScriptProcessors& process_id) const;
 	IC void add_script_process(const EScriptProcessors& process_id, CScriptProcess* script_process);

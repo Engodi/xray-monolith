@@ -3,6 +3,7 @@
 
 #include "xrdebug.h"
 #include "os_clipboard.h"
+#include "headless.h"
 
 #include <sal.h>
 #include <dxerr.h>
@@ -211,7 +212,18 @@ void xrDebug::gather_info(const char* expression, const char* description, const
 		if (shared_str_initialized)
 			Msg("stack trace:\n");
 
-        LogStackTrace(nullptr, true);
+		// The symbol walker touches module/symbol state that may be half
+		// initialised when the fault happens very early (headless startup).
+		// A failure here must not replace the original error report.
+		__try
+		{
+			LogStackTrace(nullptr, true);
+		}
+		__except (EXCEPTION_EXECUTE_HANDLER)
+		{
+			if (shared_str_initialized)
+				Msg("! [crash] stack trace failed (0x%08x)", (unsigned)GetExceptionCode());
+		}
 
 #ifdef USE_OWN_ERROR_MESSAGE_WINDOW
 		buffer += xr_sprintf(buffer, assertion_size - u32(buffer - buffer_base), "stack trace:%s%s", endline, endline);
@@ -553,9 +565,13 @@ void CALLBACK PreErrorHandler(INT_PTR)
         xr_strcpy(log_folder, sizeof(log_folder), "logs");
     }
 
-    string_path temp;
-    strconcat(sizeof(temp), temp, log_folder, log_name());
-    BT_AddLogFile(temp);
+    LPCSTR log_file = log_name();
+    if (log_file && *log_file)
+    {
+        string_path temp;
+        strconcat(sizeof(temp), temp, log_folder, log_file);
+        BT_AddLogFile(temp);
+    }
 
     if (*g_bug_report_file)
         BT_AddLogFile(g_bug_report_file);
@@ -801,20 +817,46 @@ void format_message(LPSTR buffer, const u32& buffer_size)
 //AVO: simplify function
 LONG WINAPI UnhandledFilter(_EXCEPTION_POINTERS* pExceptionInfo)
 {
+	if (!pExceptionInfo)
+		return EXCEPTION_CONTINUE_SEARCH;
+
 	string256 error_message;
 	format_message(error_message, sizeof(error_message));
 
-	CONTEXT save = *pExceptionInfo->ContextRecord;
-	//    BuildStackTrace(pExceptionInfo);
-	*pExceptionInfo->ContextRecord = save;
+	if (pExceptionInfo->ContextRecord)
+	{
+		CONTEXT save = *pExceptionInfo->ContextRecord;
+		//    BuildStackTrace(pExceptionInfo);
+		*pExceptionInfo->ContextRecord = save;
+	}
 
-    if (Debug.get_crashhandler())
-        Debug.get_crashhandler()();
+	// The crash hook executes console commands; a secondary fault inside it
+	// must never mask the original exception (the log must keep the real one).
+	if (Debug.get_crashhandler())
+	{
+		__try
+		{
+			Debug.get_crashhandler()();
+		}
+		__except (EXCEPTION_EXECUTE_HANDLER)
+		{
+			if (shared_str_initialized)
+				Msg("! [crash] crash handler failed (0x%08x)", (unsigned)GetExceptionCode());
+		}
+	}
 
 	if (shared_str_initialized)
 		Msg("stack trace:\n");
 
-    LogStackTrace(nullptr, true);
+	__try
+	{
+		LogStackTrace(nullptr, true);
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER)
+	{
+		if (shared_str_initialized)
+			Msg("! [crash] stack trace failed (0x%08x)", (unsigned)GetExceptionCode());
+	}
 
 	if (!IsDebuggerPresent())
 	{
@@ -860,14 +902,20 @@ LONG WINAPI UnhandledFilter(_EXCEPTION_POINTERS* pExceptionInfo)
     if (IsDebuggerPresent())
         DebugBreak();
 
-	ShowCursor(true);
-	ShowWindow(GetActiveWindow(), SW_FORCEMINIMIZE);
-	MessageBox(
-		GetTopWindow(NULL),
-		"Unhandled exception occured. See log for details",
-		"Fatal Error",
-		MB_OK | MB_ICONERROR | MB_SYSTEMMODAL
-	);
+	// A headless process has no user at the console: a modal box would just
+	// hang the harness. The log already contains the report, so let the
+	// process terminate normally.
+	if (!Headless::Active())
+	{
+		ShowCursor(true);
+		ShowWindow(GetActiveWindow(), SW_FORCEMINIMIZE);
+		MessageBox(
+			GetTopWindow(NULL),
+			"Unhandled exception occured. See log for details",
+			"Fatal Error",
+			MB_OK | MB_ICONERROR | MB_SYSTEMMODAL
+		);
+	}
 	//    TerminateProcess(GetCurrentProcess(), 1);
 
 	return (EXCEPTION_CONTINUE_SEARCH);
@@ -877,14 +925,20 @@ LONG WINAPI UnhandledFilter(_EXCEPTION_POINTERS* pExceptionInfo)
 #else
 LONG WINAPI UnhandledFilter(_EXCEPTION_POINTERS* pExceptionInfo)
 {
+    if (!pExceptionInfo)
+        return EXCEPTION_CONTINUE_SEARCH;
+
     string256 error_message;
     format_message(error_message, sizeof(error_message));
 
     if (!error_after_dialog && !strstr(GetCommandLine(), "-no_call_stack_assert"))
     {
-        CONTEXT save = *pExceptionInfo->ContextRecord;
+        CONTEXT save = {};
+        if (pExceptionInfo->ContextRecord)
+            save = *pExceptionInfo->ContextRecord;
         BuildStackTrace(pExceptionInfo);
-        *pExceptionInfo->ContextRecord = save;
+        if (pExceptionInfo->ContextRecord)
+            *pExceptionInfo->ContextRecord = save;
 
         if (shared_str_initialized)
             Msg("stack trace:\n");

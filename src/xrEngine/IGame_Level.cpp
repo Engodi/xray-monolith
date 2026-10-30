@@ -117,7 +117,9 @@ bool IGame_Level::Load(u32 dwNum)
 
 
 	// HUD + Environment
-	if (!g_hud)
+	// Headless: the HUD manager owns crosshair shaders/geometry and is pure
+	// presentation (F0-04). Every consumer already tolerates a null g_hud.
+	if (!g_hud && !g_dedicated_server)
 		g_hud = (CCustomHUD*)NEW_INSTANCE(CLSID_HUDMANAGER);
 
 	// Render-level Load

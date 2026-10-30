@@ -2,6 +2,7 @@
 
 #include "dxApplicationRender.h"
 #include "../../xrEngine/GameFont.h"
+#include "../../xrCore/headless.h"
 
 void draw_multiline_text(CGameFont* F, float fTargetWidth, LPCSTR pszText);
 
@@ -12,6 +13,11 @@ void dxApplicationRender::Copy(IApplicationRender& _in)
 
 void dxApplicationRender::LoadBegin()
 {
+	// Headless: the loading screen is GPU geometry (vertex buffers, shaders),
+	// which a process without a device never owns (F0-04).
+	if (Headless::Active())
+		return;
+
 	ll_hGeom.create(FVF::F_TL, RCache.Vertex.Buffer(), RCache.QuadIB);
 	sh_progress.create("hud\\default", "ui\\ui_actor_loadgame_screen");
 	hLevelLogo_Add.create("hud\\default", "ui\\ui_actor_widescreen_sidepanels.dds");
@@ -46,6 +52,12 @@ void dxApplicationRender::destroy_loading_shaders()
 
 void dxApplicationRender::setLevelLogo(LPCSTR pszLogoName)
 {
+	// Headless: level_set runs before the render level load and would create a
+	// shader with a null vertex buffer (no device) -> CreateGeom assertion.
+	// The logo is presentation-only, so skip it (F0-04).
+	if (Headless::Active())
+		return;
+
 	hLevelLogo.create("hud\\default", pszLogoName);
 }
 

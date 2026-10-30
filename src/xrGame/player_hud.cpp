@@ -11,6 +11,7 @@
 #include "weapon.h"
 #include "script_attachment_manager.h"
 #include "../xrEngine/CameraBase.h"
+#include "../xrCore/headless.h"
 
 extern int g_nearwall;
 
@@ -819,6 +820,11 @@ void player_hud::FingerCallback(CBoneInstance* B)
 
 void player_hud::load(const shared_str& player_hud_sect, bool force)
 {
+	// Headless: the HUD model is a renderable (GPU buffers + shaders) owned by
+	// the local player camera, which a headless process does not have (F0-04).
+	// Keep the (empty) player_hud object so existing call sites stay valid.
+	if (Headless::Active()) return;
+
 	if (!force && player_hud_sect == m_sect_name) return;
 
 	m_sect_name = player_hud_sect;

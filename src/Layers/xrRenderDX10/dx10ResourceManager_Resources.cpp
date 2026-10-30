@@ -20,6 +20,7 @@
 #include "../xrRenderDX10/dx10ConstantBuffer.h"
 
 #include "../xrRender/ShaderResourceTraits.h"
+#include "../../xrCore/headless.h"
 
 #ifdef USE_DX11
 SHS* CResourceManager::_CreateHS(LPCSTR Name)
@@ -602,10 +603,17 @@ void CResourceManager::DBG_VerifyGeoms()
 SGeometry* CResourceManager::CreateGeom(D3DVERTEXELEMENT9* decl, ID3DVertexBuffer* vb, ID3DIndexBuffer* ib)
 {
 	xrCriticalSectionGuard guard(creationGuard);
-	R_ASSERT(decl && vb);
 
-	SDeclaration* dcl = _CreateDecl(decl);
-	u32 vb_stride = D3DXGetDeclVertexSize(decl, 0);
+	// Headless: there is no device and therefore no vertex/index buffer, but
+	// model/shader loading still reaches this point (visuals are created CPU
+	// side). Keep the resource record and let shader creation finish; nothing
+	// is ever submitted for rendering (F0-04).
+	const bool headless = Headless::Active();
+	if (!headless)
+		R_ASSERT(decl && vb);
+
+	SDeclaration* dcl = decl ? _CreateDecl(decl) : 0;
+	u32 vb_stride = decl ? D3DXGetDeclVertexSize(decl, 0) : 0;
 
 	// ***** first pass - search already loaded shader
 	for (u32 it = 0; it < v_geoms.size(); it++)

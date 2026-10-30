@@ -2,6 +2,7 @@
 #pragma hdrstop
 
 #include "Environment.h"
+#include "../xrCore/headless.h"
 #ifndef _EDITOR
 #include "render.h"
 #endif
@@ -217,6 +218,15 @@ void CEnvironment::OnDeviceCreate()
 {
 	//. bNeed_re_create_env = TRUE;
 	m_pRender->OnDeviceCreate();
+
+	// Headless: weather/effect shaders and geometry need a device (the engine
+	// creates CEnvironment before the render level load). Keep the simulation
+	// data, skip the GPU objects (F0-04).
+	if (Headless::Active())
+	{
+		Invalidate();
+		return;
+	}
 	/*
 	sh_2sky.create (&m_b_skybox,"skybox_2t");
 	sh_2geom.create (v_skybox_fvf,RCache.Vertex.Buffer(), RCache.Index.Buffer());
@@ -251,6 +261,11 @@ void CEnvironment::OnDeviceCreate()
 void CEnvironment::OnDeviceDestroy()
 {
 	m_pRender->OnDeviceDestroy();
+
+	// Headless: weather/effect GPU objects were never created; CurrentEnv may
+	// still be null if the process aborts before the first level frame.
+	if (Headless::Active())
+		return;
 	/*
 	tsky0->surface_set (NULL);
 	tsky1->surface_set (NULL);

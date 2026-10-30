@@ -221,6 +221,9 @@ LONG WINAPI UnhandledFilter(struct _EXCEPTION_POINTERS* pExceptionInfo)
 	LONG retval = EXCEPTION_CONTINUE_SEARCH;
 	bException = TRUE;
 
+	if (!pExceptionInfo)
+		return retval;
+
 	// firstly see if dbghelp.dll is around and has the function we need
 	// look next to the EXE first, as the one in System32 might be old
 	// (e.g. Windows 2000)

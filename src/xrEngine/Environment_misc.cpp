@@ -859,6 +859,10 @@ void CEnvironment::load()
 	if (!CurrentEnv)
 		create_mixer();
 
+	// Headless note: the effects below are still created because
+	// CEnvDescriptor::load() calls eff_LensFlare/eff_Thunderbolt::AppendDef.
+	// Their GPU geometry is created through CResourceManager::CreateGeom(),
+	// which keeps a CPU-only record when no device exists (F0-04).
 	m_pRender->OnLoad();
 	//tonemap = Device.Resources->_CreateTexture("$user$tonemap"); //. hack
 	if (!eff_Rain) eff_Rain = xr_new<CEffect_Rain>();

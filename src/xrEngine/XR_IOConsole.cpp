@@ -43,8 +43,21 @@ static thread_local string256 s_script_caller;
 
 static void DumpConsoleVariablesOnCrash()
 {
-	if (Console && Console->GetBool("dump_cvar_enable"))
-		Console->Execute("dump_cvar");
+	if (!Console)
+		return;
+
+	// This runs from the unhandled-exception filter. A console command whose
+	// Status() touches a half-initialised subsystem must not fault on top of
+	// the original exception - the log has to keep the real crash.
+	__try
+	{
+		if (Console->GetBool("dump_cvar_enable"))
+			Console->Execute("dump_cvar");
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER)
+	{
+		Msg("! [crash] dump_cvar failed (0x%08x)", (unsigned)GetExceptionCode());
+	}
 }
 
 extern char const* const ioc_prompt;

@@ -29,6 +29,11 @@ tests/cpp/headless/run.sh
   `CRender::create`, `CRender::level_Load`) keep their headless early returns
   before the first GPU/shader call, and `full_memory_stats` never calls
   `lua_gc` on the (absent) headless script engine.
+- **startup degradation** (F0-04): key rebinding without DirectInput (`pInput`
+  is null headless), pcall + traceback around `_initialize`/startup scripts,
+  no model/HUD/crosshair/level-logo shader creation in headless (`player_hud`,
+  `g_hud`, `dxApplicationRender`, `CResourceManager::CreateGeom`), and a crash
+  reporter that guards null exception records and a failing console dump;
 - **simulation vs presentation split** (F0-05): `test_ai_simulation.cpp` checks
   the truth table of `ai_simulation_enabled()` (normal game and every headless
   profile own an AI space / script engine, a dedicated server does not), and the

@@ -13,6 +13,7 @@
 #include "script_process.h"
 #include "../build_config_defines.h"
 #include "script_storage.h"
+#include "../xrCore/headless.h"
 #include <unordered_map>
 #include <set>
 
@@ -208,11 +209,45 @@ xr_vector<xr_string> get_lua_stack(lua_State* L)
 	return res;
 }
 
+namespace {
+// Depth of an initialisation / bootstrap call. While >0 a script error is
+// logged instead of turning into Debug.fatal(): startup must degrade, not
+// abort the process (a headless process has no dialog and no user).
+int s_initialization_guard = 0;
+
+// Only a headless process downgrades the error to a log line; the normal game
+// keeps its historical fail-fast behaviour for class registrators.
+struct SInitializationGuard
+{
+	bool active;
+	SInitializationGuard() : active(Headless::Active())
+	{
+		if (active) ++s_initialization_guard;
+	}
+	~SInitializationGuard()
+	{
+		if (active) --s_initialization_guard;
+	}
+};
+} // namespace
+
 void CScriptEngine::lua_error(lua_State* L)
 {
 	ai().script_engine().print_stack();
 	print_output(L, "", LUA_ERRRUN);
 	ai().script_engine().on_error(L);
+
+	// A headless process has no error dialog and no user: a Lua error must be
+	// logged and the simulation must keep running (the same applies to the
+	// initialisation/bootstrap calls guarded above).
+	if (s_initialization_guard > 0 || Headless::Active())
+	{
+		LPCSTR error = lua_isstring(L, -1) ? lua_tostring(L, -1) : "(non-string error)";
+		Msg("! [SCRIPT ERROR] %s: %s", Headless::Active() ? "headless" : "initialisation", error);
+		if (lua_gettop(L) > 0)
+			lua_pop(L, 1);
+		return;
+	}
 
 	// demonized: print first line with lua error
 	auto stack = get_lua_stack(L);
@@ -260,7 +295,18 @@ void CScriptEngine::lua_error_not_crash(lua_State* L)
 
 void printLuaStack()
 {
-	ai().script_engine().print_stack();
+	// Crash-reporter path: never construct the AI space here. A fault before
+	// subsystem initialisation (or in a dedicated process without a script
+	// engine) must not turn into a second, recursive crash while the original
+	// exception is being reported.
+	if (!g_ai_space)
+		return;
+
+	CScriptEngine* engine = g_ai_space->get_script_engine();
+	if (!engine)
+		return;
+
+	engine->print_stack();
 }
 
 int CScriptEngine::lua_pcall_failed(lua_State* L)
@@ -281,6 +327,12 @@ int CScriptEngine::lua_pcall_failed(lua_State* L)
 
 	auto error_str = make_string("\n%s\n\nLUA error: %s\n\nCheck log for details", lua_error_line.c_str(), lua_isstring(L, -1) ? lua_tostring(L, -1) : "");
 	LPCSTR error_msg = error_str.c_str();
+
+	if (s_initialization_guard > 0 || Headless::Active())
+	{
+		Msg("! [SCRIPT ERROR] %s: %s", Headless::Active() ? "headless" : "initialisation", error_msg);
+		return (0);
+	}
 
 #if !XRAY_EXCEPTIONS
 	Debug.fatal(DEBUG_INFO, error_msg);
@@ -468,16 +520,41 @@ void CScriptEngine::load_common_scripts()
 			process_file(_GetItem(caScriptString, i, I));
 			xr_strcat(I, "_initialize");
 			if (object("_G", I, LUA_TFUNCTION))
-			{
-				//				lua_dostring			(lua(),xr_strcat(I,"()"));
-				::luabind::functor<void> f;
-				R_ASSERT(functor(I, f));
-				f();
-			}
+				call_script_initialize(I);
 		}
 	}
 
 	xr_delete(l_tpIniFile);
+}
+
+void CScriptEngine::call_script_initialize(LPCSTR function_name)
+{
+	lua_State* L = lua();
+	const int start = lua_gettop(L);
+
+	lua_getglobal(L, function_name);
+	if (!lua_isfunction(L, -1))
+	{
+		lua_settop(L, start);
+		return;
+	}
+
+	lua_pushcfunction(L, lua_traceback);
+	const int traceback_id = lua_gettop(L);
+	lua_insert(L, -2); // [function, handler] -> [handler, function]
+
+	const int result = lua_pcall(L, 0, 0, traceback_id);
+	if (result)
+	{
+		LPCSTR error = lua_isstring(L, -1) ? lua_tostring(L, -1) : "(non-string error)";
+		Msg("! [SCRIPT ERROR] %s: %s", function_name, error);
+		on_error(L);
+
+		if (!Headless::Active())
+			Debug.fatal(DEBUG_INFO, "[SCRIPT ERROR] %s: %s", function_name, error);
+	}
+
+	lua_settop(L, start);
 }
 
 void CScriptEngine::process_file_if_exists(LPCSTR file_name, bool warn_if_not_exist)
@@ -556,6 +633,10 @@ void CScriptEngine::register_script_classes()
 			script_log(eLuaMessageTypeError, "Cannot load class registrator %s!", I);
 			continue;
 		}
+
+		// A class registrator is an initialisation script: a Lua error inside
+		// it is logged and the remaining registrators still load.
+		SInitializationGuard guard;
 		result(const_cast<CObjectFactory*>(&object_factory()));
 	}
 }

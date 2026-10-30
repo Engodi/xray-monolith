@@ -2,6 +2,7 @@
 #pragma hdrstop
 
 #include "xr_efflensflare.h"
+#include "../xrCore/headless.h"
 
 #include "igame_persistent.h"
 #include "Environment.h"
@@ -118,6 +119,11 @@ void CLensFlareDescriptor::load(CInifile* pIni, LPCSTR sect)
 
 void CLensFlareDescriptor::OnDeviceCreate()
 {
+	// Headless: flare shaders/textures are GPU resources; the descriptor data
+	// itself is still loaded and used by the simulation (F0-04).
+	if (Headless::Active())
+		return;
+
 	// shaders
 	m_Gradient.m_pRender->CreateShader(*m_Gradient.shader, *m_Gradient.texture);
 	m_Source.m_pRender->CreateShader(*m_Source.shader, *m_Source.texture);
@@ -619,6 +625,10 @@ shared_str CLensFlare::AppendDef(CEnvironment& environment, CInifile* pIni, LPCS
 
 void CLensFlare::OnDeviceCreate()
 {
+	// Headless: no device geometry for the flare renderer (F0-04).
+	if (Headless::Active())
+		return;
+
 	// VS
 	//hGeom.create (FVF::F_LIT,RCache.Vertex.Buffer(),RCache.QuadIB);
 	m_pRender->OnDeviceCreate();

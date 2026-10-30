@@ -2,6 +2,7 @@
 #pragma hdrstop
 
 #include "IGame_Persistent.h"
+#include "../xrCore/headless.h"
 
 #ifndef _EDITOR
 #include "environment.h"
@@ -177,6 +178,14 @@ void IGame_Persistent::OnGameStart()
 #ifndef _EDITOR
 void IGame_Persistent::Prefetch()
 {
+	// Headless: model/texture prefetch creates render visuals and shaders for
+	// the GPU, which does not exist in a simulation-only process (F0-04).
+	if (Headless::Active())
+	{
+		Msg("* [headless] prefetch skipped (no GPU resources)");
+		return;
+	}
+
 	Msg("* [x-ray]: Prefetching Data");
 	// prefetch game objects & models
 	float p_time = 1000.f * Device.GetTimerGlobal()->GetElapsed_sec();

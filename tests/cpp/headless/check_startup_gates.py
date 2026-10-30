@@ -71,6 +71,20 @@ COOP_RUNTIME = Path("src/xrGame/coop/coop_core_runtime.cpp")
 HEADLESS_HEADER = Path("src/xrCore/headless.h")
 HEADLESS_SOURCE = Path("src/xrCore/headless.cpp")
 
+# F0-04 startup degradation: presentation/input paths must not run (or must
+# degrade) in a headless process, and script errors must be logged, not fatal.
+LEVEL_CONTROLLER = Path("src/xrGame/xr_level_controller.cpp")
+SCRIPT_ENGINE = Path("src/xrServerEntities/script_engine.cpp")
+APP_RENDER = Path("src/Layers/xrRender/dxApplicationRender.cpp")
+PLAYER_HUD = Path("src/xrGame/player_hud.cpp")
+GAME_PERSISTENT = Path("src/xrEngine/IGame_Persistent.cpp")
+GAME_LEVEL_ENGINE = Path("src/xrEngine/IGame_Level.cpp")
+ENVIRONMENT_RENDER = Path("src/xrEngine/Environment_render.cpp")
+LENS_FLARE = Path("src/xrEngine/xr_efflensflare.cpp")
+RESOURCE_MANAGER_DX10 = Path("src/Layers/xrRenderDX10/dx10ResourceManager_Resources.cpp")
+DEBUG_NEW = Path("src/xrCore/xrDebugNew.cpp")
+IO_CONSOLE = Path("src/xrEngine/XR_IOConsole.cpp")
+
 HEADLESS = "Headless::Active()"
 AI_PREDICATE = "ai_simulation_enabled()"
 DEDICATED = "g_dedicated_server"
@@ -521,6 +535,111 @@ def check_coop_script_engine(root: Path, errors: list[str]) -> None:
             fail(errors, path, "no ai().get_script_engine() guard found")
 
 
+def check_headless_startup_degradation(root: Path, errors: list[str]) -> None:
+    """Startup paths that need a device/input must degrade, not fault."""
+
+    # Key bindings: DirectInput is never opened in headless (pInput == null),
+    # and an unknown key name must not be dereferenced.
+    text = strip_comments(read(root / LEVEL_CONTROLLER))
+    remap = require_body(text, LEVEL_CONTROLLER, "remap_keys", errors)
+    if remap is not None:
+        if "pInput" not in remap or "get_dik_name" not in remap:
+            fail(errors, LEVEL_CONTROLLER, "remap_keys must consult pInput->get_dik_name")
+        if "pInput &&" not in remap and "if (pInput)" not in remap:
+            fail(errors, LEVEL_CONTROLLER, "remap_keys must guard the null pInput (headless has no DirectInput)")
+    to_dik = require_body(text, LEVEL_CONTROLLER, "int keyname_to_dik", errors)
+    if to_dik is not None and "?" not in to_dik and "if (!_kb)" not in to_dik:
+        fail(errors, LEVEL_CONTROLLER, "keyname_to_dik must not dereference a null _keyboard")
+
+    # Startup script calls go through a pcall boundary with a traceback, and a
+    # headless Lua error is logged instead of Debug.fatal().
+    text = strip_comments(read(root / SCRIPT_ENGINE))
+    init = require_body(text, SCRIPT_ENGINE, "CScriptEngine::call_script_initialize", errors)
+    if init is not None:
+        if "lua_pcall" not in init or "lua_traceback" not in init:
+            fail(errors, SCRIPT_ENGINE, "call_script_initialize must run behind lua_pcall + lua_traceback")
+    common = require_body(text, SCRIPT_ENGINE, "CScriptEngine::load_common_scripts", errors)
+    if common is not None and "call_script_initialize" not in common:
+        fail(errors, SCRIPT_ENGINE, "load_common_scripts must call the guarded _initialize entry point")
+    failed = require_body(text, SCRIPT_ENGINE, "CScriptEngine::lua_pcall_failed", errors)
+    if failed is not None and HEADLESS not in failed:
+        fail(errors, SCRIPT_ENGINE, "lua_pcall_failed must not Debug.fatal() in headless")
+    stack = require_body(text, SCRIPT_ENGINE, "printLuaStack", errors)
+    if stack is not None:
+        if "g_ai_space" not in stack or "get_script_engine()" not in stack:
+            fail(errors, SCRIPT_ENGINE, "printLuaStack must not construct the AI space during a crash report")
+
+    # Presentation-only render resources are skipped before the first GPU call.
+    text = strip_comments(read(root / APP_RENDER))
+    logo = require_body(text, APP_RENDER, "dxApplicationRender::setLevelLogo", errors)
+    if logo is not None and HEADLESS not in logo:
+        fail(errors, APP_RENDER, "setLevelLogo creates a shader; it must be a no-op in headless")
+    load_begin = require_body(text, APP_RENDER, "dxApplicationRender::LoadBegin", errors)
+    if load_begin is not None and HEADLESS not in load_begin:
+        fail(errors, APP_RENDER, "LoadBegin creates GPU geometry; it must be a no-op in headless")
+
+    text = strip_comments(read(root / PLAYER_HUD))
+    hud_load = require_body(text, PLAYER_HUD, "player_hud::load", errors)
+    if hud_load is not None and HEADLESS not in hud_load:
+        fail(errors, PLAYER_HUD, "player_hud::load creates a HUD model; it must be a no-op in headless")
+
+    text = strip_comments(read(root / GAME_PERSISTENT))
+    prefetch = require_body(text, GAME_PERSISTENT, "IGame_Persistent::Prefetch", errors)
+    if prefetch is not None and HEADLESS not in prefetch:
+        fail(errors, GAME_PERSISTENT, "Prefetch creates render visuals; it must be a no-op in headless")
+
+    text = strip_comments(read(root / GAME_LEVEL_ENGINE))
+    level_load = require_body(text, GAME_LEVEL_ENGINE, "IGame_Level::Load", errors)
+    if level_load is not None:
+        hud = re.search(r"CLSID_HUDMANAGER", level_load)
+        if hud is None:
+            fail(errors, GAME_LEVEL_ENGINE, "IGame_Level::Load no longer creates the HUD manager?")
+        elif "!g_dedicated_server" not in level_load[max(0, hud.start() - 200):hud.start()]:
+            fail(errors, GAME_LEVEL_ENGINE, "HUD manager creation must be gated (no HUD in headless)")
+
+    # The crash reporter must survive a null exception record / missing script
+    # engine, and the console dump must not take the process down again.
+    text = strip_comments(read(root / ENVIRONMENT_RENDER))
+    env_create = require_body(text, ENVIRONMENT_RENDER, "CEnvironment::OnDeviceCreate", errors)
+    if env_create is not None and HEADLESS not in env_create:
+        fail(errors, ENVIRONMENT_RENDER, "Environment shaders/effects must be skipped in headless")
+
+    text = strip_comments(read(root / LENS_FLARE))
+    flare = require_body(text, LENS_FLARE, "CLensFlareDescriptor::OnDeviceCreate", errors)
+    if flare is not None and HEADLESS not in flare:
+        fail(errors, LENS_FLARE, "flare shader creation must be skipped in headless")
+
+    text = strip_comments(read(root / RESOURCE_MANAGER_DX10))
+    geom = require_body(text, RESOURCE_MANAGER_DX10, "CResourceManager::CreateGeom", errors)
+    if geom is not None:
+        if HEADLESS not in geom:
+            fail(
+                errors,
+                RESOURCE_MANAGER_DX10,
+                "CreateGeom asserts on a null vertex buffer; headless model loading needs a CPU-side path",
+            )
+        else:
+            assertion = re.search(r"^\s*R_ASSERT\s*\(\s*decl\s*&&\s*vb\s*\)", geom, re.MULTILINE)
+            if assertion is not None and "!headless" not in geom[max(0, assertion.start() - 160):assertion.start()]:
+                fail(errors, RESOURCE_MANAGER_DX10, "CreateGeom keeps an unconditional decl && vb assertion")
+
+    text = strip_comments(read(root / DEBUG_NEW))
+    handler = body_of(text, "UnhandledFilter")
+    if handler is None:
+        fail(errors, DEBUG_NEW, "UnhandledFilter not found")
+    else:
+        if "if (!pExceptionInfo)" not in handler:
+            fail(errors, DEBUG_NEW, "UnhandledFilter must guard a null exception record")
+        if "__try" not in handler:
+            fail(errors, DEBUG_NEW, "crashhandler invocation must be protected from a secondary fault")
+        if "ContextRecord" in handler and "*pExceptionInfo->ContextRecord" not in handler:
+            fail(errors, DEBUG_NEW, "ContextRecord use is not guarded")
+    text = strip_comments(read(root / IO_CONSOLE))
+    dump = require_body(text, IO_CONSOLE, "DumpConsoleVariablesOnCrash", errors)
+    if dump is not None and "__try" not in dump:
+        fail(errors, IO_CONSOLE, "dump_cvar on crash must not fault on a half-initialised subsystem")
+
+
 CHECKS = (
     check_engine_api,
     check_device_create,
@@ -531,6 +650,7 @@ CHECKS = (
     check_ai_simulation_header,
     check_object_factory,
     check_coop_script_engine,
+    check_headless_startup_degradation,
 )
 
 

@@ -328,7 +328,11 @@ void remap_keys()
 	{
 		buff[0] = 0;
 		_keyboard& kb = keyboards[idx];
-		bool res = pInput->get_dik_name(kb.dik, buff, sizeof(buff));
+		// Headless (and dedicated) processes never open DirectInput, so
+		// pInput is null. Key binding still has to work in a console/script
+		// context: fall back to the canonical `key_name` instead of
+		// dereferencing the absent input device (F0-04).
+		const bool res = pInput && pInput->get_dik_name(kb.dik, buff, sizeof(buff));
 		if (res)
 			kb.key_local_name = buff;
 		else
@@ -404,7 +408,9 @@ _keyboard* dik_to_ptr(int _dik, bool bSafe)
 int keyname_to_dik(LPCSTR _name)
 {
 	_keyboard* _kb = keyname_to_ptr(_name);
-	return _kb->dik;
+	// An unknown key name (mod-supplied config, headless console script) used
+	// to dereference null here and fault during startup.
+	return _kb ? _kb->dik : 0;
 }
 
 _keyboard* keyname_to_ptr(LPCSTR _name)
@@ -778,6 +784,8 @@ void ConsoleBindCmds::save(IWriter* F)
 	for (; it != m_bindConsoleCmds.end(); ++it)
 	{
 		LPCSTR keyname = dik_to_keyname(it->first, false);
+		if (!keyname)
+			continue;
 		F->w_printf("bind_console %s %s\n", *it->second.cmd, keyname);
 	}
 }
