@@ -20,8 +20,15 @@ extern PNTAVM ntavm;
 // Поэтому сделаю два пула по эти размеры
 #define CHUNK_SIZE (64 * 1024)
 #define CHUNK_COUNT 8192
+#define POOL_SIZE ((size_t)CHUNK_SIZE * (size_t)CHUNK_COUNT)
 
-#define CHUNKS_FROM_SIZE(x) ((x + CHUNK_SIZE - 1) / CHUNK_SIZE)
+// Число чанков, покрывающих размер. Считается в size_t: раньше арифметика в
+// int на запросе около SIZE_MAX сворачивалась в 0 чанков, и XR_MMAP отдавал
+// уже занятый регион (то есть живую память) повторно.
+static size_t chunks_for(size_t size)
+{
+	return (size + (CHUNK_SIZE - 1)) / CHUNK_SIZE;
+}
 
 static int inited = 0;
 void* g_heap;
@@ -84,18 +91,25 @@ void* XR_MMAP(size_t size)
 #endif
 	if (g_heap == NULL)
 		return MFAIL;  /* pool unusable: fail the request, never a truncated pointer */
-	int chunks = CHUNKS_FROM_SIZE(size);
-	char* s = find_free(chunks);
+	// Пул выдаёт память только целыми чанками, поэтому запрос обязан
+	// помещаться в пул целиком. Zero/oversized запрос раньше превращался в
+	// 0 чанков и возвращал уже занятый регион (живую память) без пометки.
+	if (size == 0 || size > POOL_SIZE)
+		return MFAIL;
+	size_t chunks = chunks_for(size);
+	if (chunks == 0 || chunks > CHUNK_COUNT)
+		return MFAIL;
+	char* s = find_free((int)chunks);
 	void* ptr = MFAIL;
 	if (s != NULL) {
 		ptr = (char*)g_heap + CHUNK_SIZE * (s - g_heapMap);
-		for (int i = 0; i < chunks; i++)
+		for (size_t i = 0; i < chunks; i++)
 			s[i] = 'a';
 		if (s == g_firstFreeChunk)
 			g_firstFreeChunk = find_free(1);
 	}
 #ifdef DEBUG_MEM
-	sprintf(buf, " ptr=%p chunks %d\r\n", ptr, chunks);
+	sprintf(buf, " ptr=%p chunks %Iu\r\n", ptr, chunks);
 	OutputDebugString(buf);
 	dump_map(ptr, size, 'U');
 #endif
@@ -112,10 +126,32 @@ void XR_DESTROY(void* ptr, size_t size)
 #endif
 	if (g_heap == NULL || ptr == NULL || ptr == MFAIL)
 		return;  /* nothing was ever handed out by a refused pool */
-	char* s = g_heapMap + ((char*)ptr - (char*)g_heap) / CHUNK_SIZE;
-	int count = CHUNKS_FROM_SIZE(size);
-	for (int i = 0; i < count; i++)
-		s[i] = 'x';
+	// Освобождать можно только то, что выдал XR_MMAP, и только то, что
+	// покрыто запросом ЦЕЛИКОМ. Раньше индекс чанка считался с округлением
+	// вниз, а число чанков — вверх, так что free указателя, которого пул не
+	// выдавал (усечённый/устаревший указатель, «промах» вызывающего), и даже
+	// free за границей пула помечали свободными живые чанки. Следующий
+	// XR_MMAP возвращал занятую память повторно — так строка LuaJIT
+	// оказывалась внутри живой таблицы интернирования (в бакет попадал
+	// GCstr::hash с объекта+8).
+	char* p = (char*)ptr;
+	if (p < (char*)g_heap || p >= (char*)g_heap + POOL_SIZE)
+		return;  /* не наш указатель: карту пула не трогаем */
+	if (size == 0 || size > POOL_SIZE)
+		return;
+	size_t off = (size_t)(p - (char*)g_heap);
+	size_t end = off + size;
+	if (end < off)
+		return;  /* переполнение размера */
+	size_t first = (off + CHUNK_SIZE - 1) / CHUNK_SIZE;   /* чанк покрыт целиком */
+	size_t last = end / CHUNK_SIZE;
+	if (last > CHUNK_COUNT)
+		last = CHUNK_COUNT;
+	if (first >= last)
+		return;  /* ни один чанк не покрыт целиком */
+	for (size_t i = first; i < last; i++)
+		g_heapMap[i] = 'x';
+	char* s = g_heapMap + first;
 	if (s < g_firstFreeChunk || !g_firstFreeChunk)
 		g_firstFreeChunk = s;
 #ifdef DEBUG_MEM	
@@ -128,10 +164,14 @@ void XR_DESTROY(void* ptr, size_t size)
 char* find_free(int size)
 {
 	char* p = g_firstFreeChunk;
-	if (!p) return NULL;
+	if (!p || size <= 0) return NULL;
 
+	// Границу сканирования задаёт размер карты, а не нулевой байт-терминатор:
+	// одна случайная запись за пределами пула не должна превращаться в
+	// выдачу адреса вне пула.
+	char* end = g_heapMap + CHUNK_COUNT;
 	int count = 0;
-	while (*p != '\0') {
+	while (p < end) {
 		if (*p == 'x')
 			count++;
 		else
